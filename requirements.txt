@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pdfplumber
+stripe
+python-multipart
+python-dotenv
