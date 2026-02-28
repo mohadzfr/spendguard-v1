@@ -1,16 +1,19 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Dict, Any
+from dotenv import load_dotenv
 import pdfplumber
 import uuid
 import os
 import re
 import json
 import stripe
+import json
 import time
-from pydantic import BaseModel
-from typing import Dict, Any
 
-from dotenv import load_dotenv
 
 # ================= CONFIG =================
 load_dotenv()  # lit le fichier .env en local
@@ -655,23 +658,37 @@ def full(doc_id: str):
         return shell("Erreur", "<h1>Rapport introuvable</h1><p class='muted'>Refais l’aperçu.</p>")
 
     if not is_paid(doc_id):
-        return shell("Accès verrouillé", f"<h1>Accès verrouillé</h1><p class='muted'>Paiement requis.</p><a class='btn' href='/pay/{doc_id}'>Payer 9€</a>")
+        return shell(
+            "Accès verrouillé",
+            f"<h1>Accès verrouillé</h1><p class='muted'>Paiement requis.</p><a class='btn' href='/pay/{doc_id}'>Payer 9€</a>",
+        )
+
+    # Normalisation vendor (petite finition)
+    vendor = (data.get("vendor") or "UNKNOWN")
+    vendor = vendor.replace("Ia", "IA").replace("Aws", "AWS")
+
+    currency = data.get("currency", "EUR")
+    total = float(data.get("total") or 0)
+    savings = float(data.get("savings") or 0)
+    annual = round(savings * 12, 2)
 
     subject = f"Demande d’amélioration tarifaire - {data['company']}"
     body = f"""Bonjour,
 
-Nous utilisons {data['vendor']}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
+Nous utilisons {vendor}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
 Avez-vous une remise annuelle, une offre fidélité, ou un plan plus adapté ?
 
 Cordialement,
 {data['name']}"""
 
-    email_text = f"Sujet: {subject}\\n\\n{body}"
+    email_text = f"Sujet: {subject}\n\n{body}"
+    # IMPORTANT: JSON stringify pour éviter les bugs JS (apostrophes, retours ligne, etc.)
+    email_text_js = json.dumps(email_text)
 
     inner = f"""
       <h1>Rapport complet</h1>
       <p style="opacity:0.7;font-size:14px;">
-      Analyse IA basée sur optimisation SaaS B2B (benchmark 2026)
+        Analyse IA basée sur optimisation SaaS B2B (benchmark 2026)
       </p>
       <p class="subtitle">Email prêt à envoyer + export PDF.</p>
 
@@ -679,17 +696,23 @@ Cordialement,
         <div>
           <div class="kpi">
             <div class="label">Montant</div>
-            <div class="value">{data['total']} {data['currency']}</div>
+            <div class="value">{total:.2f} {currency}</div>
           </div>
 
           <div class="kpi">
             <div class="label">Économie estimée</div>
-            <div class="value green">{data['savings']} {data['currency']}</div>
+            <div class="value green">{savings:.2f} {currency}</div>
+          </div>
+
+          <div class="kpi" style="background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.25);">
+            <div class="label">Projection annuelle</div>
+            <div class="value green">{annual:.2f} {currency}</div>
+            <div class="muted" style="margin-top:6px;">(si cette dépense est mensuelle)</div>
           </div>
 
           <div class="kpi">
             <div class="label">Fournisseur</div>
-            <div class="value">{data['vendor']}</div>
+            <div class="value">{vendor}</div>
           </div>
 
           <div class="kpi">
@@ -719,7 +742,7 @@ Cordialement,
       </div>
 
       <script>
-        const emailText = `{email_text}`;
+        const emailText = {email_text_js};
         const btn = document.getElementById("copyBtn");
         const msg = document.getElementById("copyMsg");
         btn.addEventListener("click", async () => {{
@@ -746,10 +769,18 @@ def print_view(doc_id: str):
     if not is_paid(doc_id):
         return HTMLResponse("Paiement requis", status_code=403)
 
+    vendor = (data.get("vendor") or "UNKNOWN")
+    vendor = vendor.replace("Ia", "IA").replace("Aws", "AWS")
+
+    currency = data.get("currency", "EUR")
+    total = float(data.get("total") or 0)
+    savings = float(data.get("savings") or 0)
+    annual = round(savings * 12, 2)
+
     subject = f"Demande d’amélioration tarifaire - {data['company']}"
     body = f"""Bonjour,
 
-Nous utilisons {data['vendor']}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
+Nous utilisons {vendor}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
 Avez-vous une remise annuelle, une offre fidélité, ou un plan plus adapté ?
 
 Cordialement,
@@ -786,6 +817,10 @@ Cordialement,
           border-radius:12px;
           padding:14px;
         }}
+        .kpi.greenbox {{
+          border:1px solid #86efac;
+          background:#f0fdf4;
+        }}
         .label {{ color:#6b7280; font-size:12px; }}
         .value {{ font-size:18px; font-weight:700; margin-top:6px; }}
         .green {{ color:#16a34a; }}
@@ -806,21 +841,20 @@ Cordialement,
       <div class="kpis">
         <div class="kpi">
           <div class="label">Montant</div>
-          <div class="value">{data['total']} {data['currency']}</div>
+          <div class="value">{total:.2f} {currency}</div>
         </div>
         <div class="kpi">
           <div class="label">Économie estimée</div>
-          <div class="value green">{data['savings']} {data['currency']}</div>
+          <div class="value green">{savings:.2f} {currency}</div>
+        </div>
+        <div class="kpi greenbox">
+          <div class="label">Projection annuelle</div>
+          <div class="value green">{annual:.2f} {currency}</div>
+          <div class="label" style="margin-top:6px;">(si dépense mensuelle)</div>
         </div>
         <div class="kpi">
           <div class="label">Fournisseur</div>
-          <div class="value">{data['vendor']}</div>
-        </div>
-        <div class="kpi">
-          <div class="label">Checklist</div>
-          <div class="value" style="font-size:14px;font-weight:500;line-height:1.4;">
-            Envoyer l’email • Demander remise/downgrade • Vérifier licences • Revue mensuelle
-          </div>
+          <div class="value">{vendor}</div>
         </div>
       </div>
 
@@ -831,8 +865,6 @@ Cordialement,
     </body>
     </html>
     """
-
-
 @app.get("/health")
 def health():
     return {"status": "running"}
