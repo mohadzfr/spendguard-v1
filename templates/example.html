@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>SpendGuard — Exemple</title>
+    <style>
+      body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#050b1a;color:#e9eefc}
+      .wrap{max-width:980px;margin:0 auto;padding:56px 18px}
+      .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:22px;box-shadow:0 18px 40px rgba(0,0,0,.35)}
+      .btn{display:inline-block;background:#3b82f6;color:white;padding:12px 16px;border-radius:12px;text-decoration:none;font-weight:800}
+      .btn2{display:inline-block;background:rgba(255,255,255,.10);color:white;padding:12px 16px;border-radius:12px;text-decoration:none;font-weight:800;border:1px solid rgba(255,255,255,.14)}
+      .muted{opacity:.78}
+      pre{white-space:pre-wrap;background:rgba(0,0,0,.25);padding:14px;border-radius:12px;border:1px solid rgba(255,255,255,.10)}
+      .top{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+      .logo{font-weight:900;letter-spacing:.02em}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="top">
+        <div class="logo">SpendGuard</div>
+        <div>
+          <a class="btn2" href="/pricing">Tarifs</a>
+          <a class="btn2" href="/">Nouvelle analyse</a>
+        </div>
+      </div>
+
+      <h1 style="margin:18px 0 10px">Exemple de rapport</h1>
+      <p class="muted">Voici à quoi ressemble un rapport complet (exemple). Le vrai rapport est généré à partir de ta facture.</p>
+
+      <div class="card" style="margin-top:16px">
+        <h2 style="margin:0 0 10px">Rapport SpendGuard (exemple)</h2>
+        <p><b>Montant détecté :</b> 5400 EUR</p>
+        <p><b>Économie potentielle estimée :</b> 810 EUR</p>
+        <p><b>Opportunités :</b> négociation / annualisation / downgrade</p>
+
+        <h3>Email prêt à envoyer</h3>
+        <pre>Sujet: Demande d’amélioration tarifaire
+
+Bonjour,
+
+Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire (remise, annualisation ou plan plus adapté).
+Pouvez-vous nous proposer une offre améliorée ?
+
+Cordialement,
+[Votre nom]</pre>
+
+        <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+          <a class="btn" href="/">Lancer mon audit</a>
+          <a class="btn2" href="/pricing">Débloquer à 9€</a>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

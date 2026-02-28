@@ -726,3 +726,21 @@ Cordialement,
 @app.get("/health")
 def health():
     return {"status": "running"}
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/pricing", response_class=HTMLResponse)
+def pricing():
+    try:
+        with open("templates/pricing.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "<h1>pricing.html manquant</h1>"
+
+@app.get("/example", response_class=HTMLResponse)
+def example():
+    try:
+        with open("templates/example.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "<h1>example.html manquant</h1>"

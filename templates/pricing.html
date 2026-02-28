@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>SpendGuard — Tarifs</title>
+    <style>
+      body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#050b1a;color:#e9eefc}
+      .wrap{max-width:980px;margin:0 auto;padding:56px 18px}
+      .hero{display:flex;gap:24px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
+      .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:22px;box-shadow:0 18px 40px rgba(0,0,0,.35)}
+      .big{font-size:44px;margin:0;letter-spacing:-.03em}
+      .sub{opacity:.85;margin:10px 0 0}
+      .grid{display:grid;grid-template-columns:1fr;gap:14px;margin-top:18px}
+      @media(min-width:860px){.grid{grid-template-columns:1.1fr .9fr}}
+      .price{font-size:46px;font-weight:800;margin:0}
+      .badge{display:inline-block;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.35);padding:6px 10px;border-radius:999px;font-weight:700;font-size:13px}
+      .btn{display:inline-block;background:#3b82f6;color:white;padding:12px 16px;border-radius:12px;text-decoration:none;font-weight:800}
+      .btn2{display:inline-block;background:rgba(255,255,255,.10);color:white;padding:12px 16px;border-radius:12px;text-decoration:none;font-weight:800;border:1px solid rgba(255,255,255,.14)}
+      ul{margin:12px 0 0;padding-left:18px;opacity:.92}
+      li{margin:8px 0}
+      .muted{opacity:.75;font-size:14px}
+      .faq h3{margin:18px 0 6px}
+      .top{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+      .logo{font-weight:900;letter-spacing:.02em}
+      a{color:#a8c7ff}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="top">
+        <div class="logo">SpendGuard</div>
+        <div>
+          <a class="btn2" href="/example">Voir un exemple</a>
+          <a class="btn2" href="/">Nouvelle analyse</a>
+        </div>
+      </div>
+
+      <div class="hero" style="margin-top:22px">
+        <div style="flex:1 1 520px">
+          <h1 class="big">Débloquez le rapport complet</h1>
+          <p class="sub">Email prêt à envoyer + export PDF + checklist d’économies. Paiement sécurisé.</p>
+          <div style="margin-top:14px" class="badge">Garantie test : si ça ne sert à rien → remboursé*</div>
+          <p class="muted" style="margin-top:10px">* MVP : on gère ça manuellement par email pour l’instant.</p>
+        </div>
+
+        <div class="card" style="flex:1 1 320px">
+          <p class="price">9€</p>
+          <p class="muted">par rapport (paiement unique)</p>
+          <ul>
+            <li>Montant + fournisseur + opportunités</li>
+            <li>Email de négociation prêt à copier</li>
+            <li>Export PDF propre</li>
+            <li>Accès débloqué après paiement</li>
+          </ul>
+          <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap">
+            <a class="btn" href="/">Lancer une analyse</a>
+            <a class="btn2" href="/example">Voir l’exemple</a>
+          </div>
+          <p class="muted" style="margin-top:12px">Tu paies seulement quand le rapport est prêt.</p>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="card faq">
+          <h2 style="margin:0 0 10px">FAQ</h2>
+          <h3>Je dois déposer quoi ?</h3>
+          <p class="muted">Une facture PDF (idéalement abonnement SaaS / services). On analyse et propose des actions.</p>
+          <h3>Mes documents sont-ils stockés ?</h3>
+          <p class="muted">MVP : stockage temporaire pour générer le rapport. (On peut ajouter suppression automatique ensuite.)</p>
+          <h3>Pourquoi 9€ ?</h3>
+          <p class="muted">Parce qu’un seul email de négociation peut faire économiser beaucoup plus.</p>
+        </div>
+
+        <div class="card">
+          <h2 style="margin:0 0 10px">Tu veux un audit récurrent ?</h2>
+          <p class="muted">Prochaine étape : abonnement mensuel + suivi des renouvellements + alertes.</p>
+          <p class="muted">Si tu veux être bêta-testeur : écris “BETA” par email à toi-même pour t’en souvenir 😄</p>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
