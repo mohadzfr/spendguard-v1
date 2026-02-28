@@ -109,21 +109,117 @@ def detect_currency(text: str) -> str:
         return "GBP"
     return "UNKNOWN"
 
-def detect_vendor(raw_lower: str) -> str:
-    vendors = ["google", "notion", "microsoft", "adobe", "slack", "stripe", "aws", "ovh", "github", "canva"]
-    for v in vendors:
-        if v in raw_lower:
-            return v.capitalize()
-    return "Fournisseur détecté"
+def detect_vendor(raw_text: str) -> str:
+    text = raw_text.strip()
+    low = text.lower()
+
+    # 1) Règles simples (marques fréquentes)
+    brands = [
+        ("google", "Google"),
+        ("workspace", "Google Workspace"),
+        ("notion", "Notion"),
+        ("microsoft", "Microsoft"),
+        ("office 365", "Microsoft 365"),
+        ("azure", "Microsoft Azure"),
+        ("adobe", "Adobe"),
+        ("slack", "Slack"),
+        ("stripe", "Stripe"),
+        ("amazon web services", "AWS"),
+        ("aws", "AWS"),
+        ("ovh", "OVHcloud"),
+        ("github", "GitHub"),
+        ("canva", "Canva"),
+        ("dropbox", "Dropbox"),
+        ("zoom", "Zoom"),
+        ("hubspot", "HubSpot"),
+        ("shopify", "Shopify"),
+        ("openai", "OpenAI"),
+    ]
+    for key, name in brands:
+        if key in low:
+            return name
+
+    # 2) Cherche une ligne "Facturé par", "Vendor", "Fournisseur", etc.
+    patterns = [
+        r"(factur[eé]\s*par|fournisseur|vendor|seller|issued by)\s*[:\-]\s*(.+)",
+        r"(soci[eé]t[eé]|company)\s*[:\-]\s*(.+)",
+    ]
+    for p in patterns:
+        m = re.search(p, low, re.IGNORECASE)
+        if m:
+            cand = m.group(m.lastindex).strip()
+            cand = cand.split("\n")[0].strip()
+            if 3 <= len(cand) <= 80:
+                return cand.title()
+
+    # 3) Heuristique : souvent le nom est dans les 10 premières lignes
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    head = lines[:12]
+    # ignore lignes trop "génériques"
+    bad = ("facture", "invoice", "date", "total", "tva", "vat", "adresse", "address")
+    for l in head:
+        ll = l.lower()
+        if len(l) < 4 or any(b in ll for b in bad):
+            continue
+        # Si ligne contient beaucoup de lettres, peu de chiffres → bon candidat
+        letters = sum(c.isalpha() for c in l)
+        digits = sum(c.isdigit() for c in l)
+        if letters >= 6 and digits <= 2 and len(l) <= 60:
+            return l
+
+    return "UNKNOWN"
 
 def extract_total_amount(raw_text: str) -> float:
-    matches = re.findall(r"([0-9]+(?:[.,][0-9]+)?)\s*(€|\$|£)", raw_text)
-    if matches:
-        raw = matches[-1][0].replace(",", ".")
+    t = raw_text.replace("\u00a0", " ")  # espaces insécables
+    low = t.lower()
+
+    # Priorité: lignes "total" / "amount due" etc.
+    priority_keys = [
+        "total ttc", "montant ttc", "total à payer", "net à payer",
+        "amount due", "total due", "total", "grand total"
+    ]
+
+    def parse_number(s: str) -> float:
+        s = s.strip()
+        s = s.replace(" ", "")
+        # 1 234,56 -> 1234.56
+        if "," in s and "." in s:
+            # cas 1.234,56 -> on enlève les points
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", "")
+        else:
+            s = s.replace(",", ".")
         try:
-            return float(raw)
+            return float(s)
         except:
             return 0.0
+
+    # Cherche une valeur sur les lignes prioritaires
+    lines = [l.strip() for l in t.splitlines() if l.strip()]
+    for l in lines:
+        ll = l.lower()
+        if any(k in ll for k in priority_keys):
+            m = re.search(r"([0-9]{1,3}(?:[ .][0-9]{3})*(?:[.,][0-9]{2})?)", l)
+            if m:
+                val = parse_number(m.group(1))
+                if val > 0:
+                    return val
+
+    # fallback : dernier montant avec symbole ou code
+    matches = re.findall(r"([0-9]{1,3}(?:[ .][0-9]{3})*(?:[.,][0-9]{2})?)\s*(€|eur|usd|\$|gbp|£)", low)
+    if matches:
+        val = parse_number(matches[-1][0])
+        if val > 0:
+            return val
+
+    # fallback 2 : dernier nombre formaté
+    m2 = re.findall(r"([0-9]{1,3}(?:[ .][0-9]{3})*(?:[.,][0-9]{2}))", low)
+    if m2:
+        val = parse_number(m2[-1])
+        return val if val > 0 else 0.0
+
     return 0.0
 
 def shell(title: str, inner: str) -> str:
@@ -326,10 +422,12 @@ async def preview(
     raw_text = "\n".join(raw_parts)
     raw_lower = raw_text.lower()
 
-    vendor = detect_vendor(raw_lower)
+    vendor = detect_vendor(raw_text)
     currency = detect_currency(raw_text)
     total = extract_total_amount(raw_text)
-    savings = round(total * 0.15, 2) if total > 0 else 0.0
+    # Estimation plus “business” (plafonnée)
+    rate = 0.10 if total < 1000 else 0.15
+    savings = round(min(total * rate, 2500), 2) if total > 0 else 0.0
 
     set_report(doc_id, {
         "company": company_name,
