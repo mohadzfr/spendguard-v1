@@ -13,7 +13,19 @@ import json
 import stripe
 import json
 import time
+import secrets
+import hmac
+import hashlib
 
+def sign_doc(doc_id: str) -> str:
+    msg = doc_id.encode()
+    key = APP_SECRET.encode()
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:16]
+
+def check_sig(doc_id: str, t: str) -> bool:
+    if not t:
+        return False
+    return hmac.compare_digest(sign_doc(doc_id), t)
 
 # ================= CONFIG =================
 load_dotenv()  # lit le fichier .env en local
@@ -21,7 +33,7 @@ load_dotenv()  # lit le fichier .env en local
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-
+APP_SECRET = os.getenv("APP_SECRET", "change-me-please")
 PRICE_CENTS = 900
 CURRENCY = "eur"
 
@@ -74,7 +86,15 @@ def mark_paid(doc_id: str) -> None:
     if doc_id not in state["paid"]:
         state["paid"].append(doc_id)
         save_state(state)
+def sign_doc(doc_id: str) -> str:
+    msg = doc_id.encode("utf-8")
+    key = APP_SECRET.encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:16]
 
+def check_sig(doc_id: str, t: str) -> bool:
+    if not t:
+        return False
+    return hmac.compare_digest(sign_doc(doc_id), t)
 def is_paid(doc_id: str) -> bool:
     try:
         seven_days_ago = int(time.time()) - 7 * 24 * 3600
@@ -558,66 +578,121 @@ async def preview(
 
 
 # ================= PAIEMENT (Stripe Elements) =================
-@app.get("/pay/{doc_id}", response_class=HTMLResponse)
-def pay(doc_id: str):
-    d = get_report(doc_id)
-    if not d:
+@app.get("/full/{doc_id}", response_class=HTMLResponse)
+def full(request: Request, doc_id: str):
+    data = get_report(doc_id)
+    if not data:
         return shell("Erreur", "<h1>Rapport introuvable</h1><p class='muted'>Refais l’aperçu.</p>")
 
-    if is_paid(doc_id):
-        return RedirectResponse(url=f"/full/{doc_id}", status_code=303)
+    # ✅ vérif token signé
+    t = request.query_params.get("t")
+    if not check_sig(doc_id, t):
+        return shell(
+            "Lien invalide",
+            "<h1>Lien invalide</h1><p class='muted'>Reviens via le lien reçu après paiement.</p>"
+        )
 
-    currency = d.get("currency", "EUR")
-    total = float(d.get("total") or 0)
-    savings = float(d.get("savings") or 0)
+    # ✅ vérif paiement
+    if not is_paid(doc_id):
+        return shell(
+            "Accès verrouillé",
+            f"<h1>Accès verrouillé</h1><p class='muted'>Paiement requis.</p><a class='btn' href='/pay/{doc_id}'>Payer 9€</a>",
+        )
+
+    # Normalisation vendor
+    vendor = (data.get("vendor") or "UNKNOWN")
+    vendor = vendor.replace("Ia", "IA").replace("Aws", "AWS")
+
+    currency = data.get("currency", "EUR")
+    total = float(data.get("total") or 0)
+    savings = float(data.get("savings") or 0)
     annual = round(savings * 12, 2)
 
-    vendor = (d.get("vendor") or "UNKNOWN").replace("Ia", "IA").replace("Aws", "AWS")
+    subject = f"Demande d’amélioration tarifaire - {data['company']}"
+    body = f"""Bonjour,
+
+Nous utilisons {vendor}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
+Avez-vous une remise annuelle, une offre fidélité, ou un plan plus adapté ?
+
+Cordialement,
+{data['name']}"""
+
+    email_text = f"Sujet: {subject}\n\n{body}"
+    email_text_js = json.dumps(email_text)
 
     inner = f"""
-      <h1>Paiement</h1>
-      <p class="subtitle">Débloque le rapport complet. Montant : 9€.</p>
-
-      <div class="steps">
-        <span class="step done">1. Aperçu ✓</span>
-        <span class="step active">2. Paiement</span>
-        <span class="step">3. Rapport complet</span>
-      </div>
+      <h1>Rapport complet</h1>
+      <p style="opacity:0.7;font-size:14px;">
+        Analyse IA basée sur optimisation SaaS B2B (benchmark 2026)
+      </p>
+      <p class="subtitle">Email prêt à envoyer + export PDF.</p>
 
       <div class="grid">
         <div>
           <div class="kpi">
-            <div class="label">Résumé</div>
-            <div class="value" style="font-size:22px;">{vendor}</div>
-            <div class="muted" style="margin-top:6px;">Montant détecté : <b>{total:.2f} {currency}</b></div>
-            <div class="muted">Économie estimée : <b class="green">{savings:.2f} {currency}</b></div>
+            <div class="label">Montant</div>
+            <div class="value">{total:.2f} {currency}</div>
+          </div>
+
+          <div class="kpi">
+            <div class="label">Économie estimée</div>
+            <div class="value green">{savings:.2f} {currency}</div>
           </div>
 
           <div class="kpi" style="background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.25);">
             <div class="label">Projection annuelle</div>
-            <div style="margin-top:6px;line-height:1.4;">
-              Si cette dépense est mensuelle, cela représente
-              <span class="green" style="font-weight:800;">{annual:.2f} {currency}</span>
-              économisables par an.
-            </div>
+            <div class="value green">{annual:.2f} {currency}</div>
+            <div class="muted" style="margin-top:6px;">(si cette dépense est mensuelle)</div>
           </div>
 
           <div class="kpi">
-            <div class="label">Conseil</div>
-            <pre>🎯 Objectif : obtenir une remise
-🧠 Demande : annualisation + downgrade + licences inutilisées
-⏱ Temps : 2 minutes</pre>
+            <div class="label">Fournisseur</div>
+            <div class="value">{vendor}</div>
           </div>
 
-          <p style="margin-top:18px;"><a class="link" href="/">← Retour</a></p>
+          <div class="kpi">
+            <div class="label">Checklist</div>
+            <pre>✅ Envoyer l’email
+✅ Demander remise annuelle / downgrade
+✅ Vérifier licences inutilisées
+✅ Revue mensuelle des abonnements</pre>
+          </div>
+
+          <div class="row-actions">
+            <button class="btn btn-secondary" id="copyBtn">Copier l’email</button>
+            <a class="btn" href="/print/{doc_id}?t={t}" target="_blank">Télécharger PDF</a>
+          </div>
+
+          <p class="muted" id="copyMsg" style="margin-top:10px;"></p>
         </div>
 
         <div>
-          {render_stripe_checkout(doc_id)}
+          <div class="kpi">
+            <div class="label">Email prêt</div>
+            <pre id="emailBlock">Sujet: {subject}
+
+{body}</pre>
+          </div>
         </div>
       </div>
+
+      <script>
+        const emailText = {email_text_js};
+        const btn = document.getElementById("copyBtn");
+        const msg = document.getElementById("copyMsg");
+        btn.addEventListener("click", async () => {{
+          try {{
+            await navigator.clipboard.writeText(emailText);
+            msg.textContent = "✅ Email copié dans le presse-papier.";
+          }} catch (e) {{
+            msg.textContent = "⚠️ Copie automatique refusée. Sélectionne le texte et copie manuellement.";
+          }}
+        }});
+      </script>
+
+      <p style="margin-top:18px;"><a class="link" href="/">← Nouvelle analyse</a></p>
     """
-    return shell("Paiement", inner)
+    return shell("Rapport complet", inner)
 
 
 # ================= CREATE PAYMENT INTENT =================
@@ -802,7 +877,11 @@ Cordialement,
 
 # ================= PAGE PRINT (PDF) =================
 @app.get("/print/{doc_id}", response_class=HTMLResponse)
-def print_view(doc_id: str):
+def print_view(request: Request, doc_id: str):
+    t = request.query_params.get("t")
+    if not check_sig(doc_id, t):
+        return HTMLResponse("Lien invalide (token manquant ou incorrect).", status_code=403)
+
     data = get_report(doc_id)
     if not data:
         return HTMLResponse("Rapport introuvable", status_code=404)
