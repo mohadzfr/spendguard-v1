@@ -72,8 +72,16 @@ def mark_paid(doc_id: str) -> None:
         save_state(state)
 
 def is_paid(doc_id: str) -> bool:
-    state = load_state()
-    return doc_id in set(state["paid"])
+    # source de vérité = Stripe (pas de disque)
+    try:
+        intents = stripe.PaymentIntent.list(limit=100)
+        for pi in intents.data:
+            md = pi.metadata or {}
+            if md.get("doc_id") == doc_id and pi.status == "succeeded":
+                return True
+        return False
+    except Exception:
+        return False
 
 
 # ================= UTILITAIRES =================
