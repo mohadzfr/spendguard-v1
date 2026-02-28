@@ -150,7 +150,9 @@ def detect_vendor(raw_text: str) -> str:
             cand = m.group(m.lastindex).strip()
             cand = cand.split("\n")[0].strip()
             if 3 <= len(cand) <= 80:
-                return cand.title()
+                cand = cand.title()
+                cand = cand.replace("Ia", "IA").replace("Aws", "AWS").replace("Hubspot", "HubSpot")
+                return cand
 
     # 3) Heuristique : souvent le nom est dans les 10 premières lignes
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -166,7 +168,7 @@ def detect_vendor(raw_text: str) -> str:
         digits = sum(c.isdigit() for c in l)
         if letters >= 6 and digits <= 2 and len(l) <= 60:
             return l
-
+  
     return "UNKNOWN"
 
 def extract_total_amount(raw_text: str) -> float:
@@ -505,6 +507,13 @@ def pay(doc_id: str):
             <div class="value">{d["vendor"]}</div>
             <p class="muted" style="margin:8px 0 0 0;">Montant détecté : {d["total"]} {d["currency"]}</p>
             <p class="muted" style="margin:6px 0 0 0;">Économie estimée : <span class="green"><strong>{d["savings"]} {d["currency"]}</strong></span></p>
+            <div style="margin-top:20px;padding:15px;background:rgba(0,255,100,0.08);border-radius:10px;">
+              <strong>Projection annuelle :</strong><br>
+              Si cette dépense est mensuelle, cela représente
+              <span style="color:#22c55e;font-weight:bold;">
+                {{ (d["savings"] * 12)|round(2) }} EUR économisables par an
+              </span>
+            </div>
           </div>
 
           <div class="kpi">
@@ -661,6 +670,9 @@ Cordialement,
 
     inner = f"""
       <h1>Rapport complet</h1>
+      <p style="opacity:0.7;font-size:14px;">
+      Analyse IA basée sur optimisation SaaS B2B (benchmark 2026)
+      </p>
       <p class="subtitle">Email prêt à envoyer + export PDF.</p>
 
       <div class="grid">
