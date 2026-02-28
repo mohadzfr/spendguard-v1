@@ -450,7 +450,7 @@ def render_stripe_checkout(doc_id: str) -> str:
           const {{ error }} = await stripe.confirmPayment({{
             elements,
             confirmParams: {{
-              return_url: window.location.origin + "/full/{doc_id}"
+              return_url: window.location.origin + "/success/{doc_id}?t={sign_doc(doc_id)}"
             }}
           }});
 
