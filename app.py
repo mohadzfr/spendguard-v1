@@ -373,7 +373,78 @@ def shell(title: str, inner: str) -> str:
     </body>
     </html>
     """
+def render_stripe_checkout(doc_id: str) -> str:
+    # Stripe Elements intégré (Payment Element)
+    # Nécessite un endpoint POST /create-payment-intent qui retourne {client_secret: "..."}
+    return f"""
+    <div class="kpi" style="background:rgba(255,255,255,.06);">
+      <div class="label">Paiement sécurisé</div>
 
+      <div id="paybox" style="margin-top:10px;">
+        <div id="payment-element"></div>
+
+        <button id="submit" class="btn" style="width:100%;margin-top:14px;">
+          Payer et débloquer
+        </button>
+
+        <p class="muted" id="payMsg" style="margin-top:10px;"></p>
+        <p class="muted" style="margin-top:8px;font-size:12px;">
+          Carte test : <b>4242 4242 4242 4242</b> (date future, CVC 123).
+        </p>
+      </div>
+    </div>
+
+    <script src="https://js.stripe.com/v3/"></script>
+    <script>
+      (async () => {{
+        const msg = document.getElementById("payMsg");
+        const btn = document.getElementById("submit");
+
+        const stripe = Stripe("{STRIPE_PUBLISHABLE_KEY}");
+        const res = await fetch("/create-payment-intent", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ doc_id: "{doc_id}" }})
+        }});
+
+        if (!res.ok) {{
+          msg.textContent = "⚠️ Erreur serveur (create-payment-intent).";
+          return;
+        }}
+
+        const data = await res.json();
+        if (!data.client_secret) {{
+          msg.textContent = "⚠️ client_secret manquant.";
+          return;
+        }}
+
+        const elements = stripe.elements({{ clientSecret: data.client_secret }});
+        const paymentElement = elements.create("payment");
+        paymentElement.mount("#payment-element");
+
+        btn.addEventListener("click", async (e) => {{
+          e.preventDefault();
+          btn.disabled = true;
+          msg.textContent = "⏳ Paiement en cours…";
+
+          const {{ error }} = await stripe.confirmPayment({{
+            elements,
+            confirmParams: {{
+              return_url: window.location.origin + "/full/{doc_id}"
+            }}
+          }});
+
+          if (error) {{
+            msg.textContent = "⚠️ " + (error.message || "Paiement refusé");
+            btn.disabled = false;
+          }}
+        }});
+      }})().catch(err => {{
+        const msg = document.getElementById("payMsg");
+        if (msg) msg.textContent = "⚠️ Erreur : " + err;
+      }});
+    </script>
+    """
 
 # ================= LANDING =================
 @app.get("/", response_class=HTMLResponse)
@@ -491,91 +562,60 @@ async def preview(
 def pay(doc_id: str):
     d = get_report(doc_id)
     if not d:
-        return shell("Erreur", "<h1>doc_id introuvable</h1><p class='muted'>Refais l’aperçu.</p>")
+        return shell("Erreur", "<h1>Rapport introuvable</h1><p class='muted'>Refais l’aperçu.</p>")
+
+    if is_paid(doc_id):
+        return RedirectResponse(url=f"/full/{doc_id}", status_code=303)
+
+    currency = d.get("currency", "EUR")
+    total = float(d.get("total") or 0)
+    savings = float(d.get("savings") or 0)
+    annual = round(savings * 12, 2)
+
+    vendor = (d.get("vendor") or "UNKNOWN").replace("Ia", "IA").replace("Aws", "AWS")
 
     inner = f"""
       <h1>Paiement</h1>
-      <p class="subtitle">Débloque le rapport complet. Montant : <strong>9€</strong>.</p>
+      <p class="subtitle">Débloque le rapport complet. Montant : 9€.</p>
 
-      <div class="stepper">
-        <div class="step"><strong>1.</strong> Aperçu ✅</div>
-        <div class="step"><strong>2.</strong> Paiement</div>
-        <div class="step"><strong>3.</strong> Rapport complet</div>
+      <div class="steps">
+        <span class="step done">1. Aperçu ✓</span>
+        <span class="step active">2. Paiement</span>
+        <span class="step">3. Rapport complet</span>
       </div>
 
       <div class="grid">
         <div>
           <div class="kpi">
             <div class="label">Résumé</div>
-            <div class="value">{d["vendor"]}</div>
-            <p class="muted" style="margin:8px 0 0 0;">Montant détecté : {d["total"]} {d["currency"]}</p>
-            <p class="muted" style="margin:6px 0 0 0;">Économie estimée : <span class="green"><strong>{d["savings"]} {d["currency"]}</strong></span></p>
-            <div style="margin-top:20px;padding:15px;background:rgba(0,255,100,0.08);border-radius:10px;">
-              <strong>Projection annuelle :</strong><br>
+            <div class="value" style="font-size:22px;">{vendor}</div>
+            <div class="muted" style="margin-top:6px;">Montant détecté : <b>{total:.2f} {currency}</b></div>
+            <div class="muted">Économie estimée : <b class="green">{savings:.2f} {currency}</b></div>
+          </div>
+
+          <div class="kpi" style="background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.25);">
+            <div class="label">Projection annuelle</div>
+            <div style="margin-top:6px;line-height:1.4;">
               Si cette dépense est mensuelle, cela représente
-              <span style="color:#22c55e;font-weight:bold;">
-                {{ (d["savings"] * 12)|round(2) }} EUR économisables par an
-              </span>
+              <span class="green" style="font-weight:800;">{annual:.2f} {currency}</span>
+              économisables par an.
             </div>
           </div>
 
           <div class="kpi">
             <div class="label">Conseil</div>
             <pre>🎯 Objectif : obtenir une remise
-📌 Demande : annualisation + downgrade + licences inutilisées
-⏱️ Temps : 2 minutes</pre>
+🧠 Demande : annualisation + downgrade + licences inutilisées
+⏱ Temps : 2 minutes</pre>
           </div>
+
+          <p style="margin-top:18px;"><a class="link" href="/">← Retour</a></p>
         </div>
 
         <div>
-          <div class="white-panel">
-            <h3>Paiement sécurisé</h3>
-            <div id="error" class="danger"></div>
-            <div id="payment-element"></div>
-            <button class="btn" id="payBtn" style="margin-top:14px;">Payer et débloquer</button>
-            <div class="hint">Carte test : <strong>4242 4242 4242 4242</strong> (date future, CVC 123).</div>
-          </div>
+          {render_stripe_checkout(doc_id)}
         </div>
       </div>
-
-      <script src="https://js.stripe.com/v3/"></script>
-      <script>
-        const docId = "{doc_id}";
-        const stripe = Stripe("{STRIPE_PUBLISHABLE_KEY}");
-
-        async function boot() {{
-          const res = await fetch("/create-payment-intent", {{
-            method: "POST",
-            headers: {{ "Content-Type": "application/json" }},
-            body: JSON.stringify({{ doc_id: docId }})
-          }});
-          const data = await res.json();
-          if (!data.client_secret) {{
-            document.getElementById("error").innerText = "Erreur paiement: " + (data.detail || "client_secret manquant");
-            return;
-          }}
-
-          const elements = stripe.elements({{ clientSecret: data.client_secret }});
-          const paymentElement = elements.create("payment", {{ layout: "tabs" }});
-          paymentElement.mount("#payment-element");
-
-          document.getElementById("payBtn").addEventListener("click", async () => {{
-            document.getElementById("error").innerText = "";
-            const result = await stripe.confirmPayment({{
-              elements,
-              confirmParams: {{
-                return_url: window.location.origin + "/paid/" + docId
-              }}
-            }});
-            if (result.error) {{
-              document.getElementById("error").innerText = result.error.message;
-            }}
-          }});
-        }}
-        boot();
-      </script>
-
-      <p style="margin-top:18px;"><a class="link" href="/">← Retour</a></p>
     """
     return shell("Paiement", inner)
 
