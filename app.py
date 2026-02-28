@@ -6,6 +6,7 @@ import os
 import re
 import json
 import stripe
+import time
 from pydantic import BaseModel
 from typing import Dict, Any
 
@@ -72,13 +73,27 @@ def mark_paid(doc_id: str) -> None:
         save_state(state)
 
 def is_paid(doc_id: str) -> bool:
-    # source de vérité = Stripe (pas de disque)
     try:
-        intents = stripe.PaymentIntent.list(limit=100)
-        for pi in intents.data:
-            md = pi.metadata or {}
-            if md.get("doc_id") == doc_id and pi.status == "succeeded":
-                return True
+        seven_days_ago = int(time.time()) - 7 * 24 * 3600
+        starting_after = None
+
+        while True:
+            params = {"limit": 100, "created": {"gte": seven_days_ago}}
+            if starting_after:
+                params["starting_after"] = starting_after
+
+            intents = stripe.PaymentIntent.list(**params)
+
+            for pi in intents.data:
+                md = pi.metadata or {}
+                if md.get("doc_id") == doc_id and pi.status == "succeeded":
+                    return True
+
+            if intents.has_more and intents.data:
+                starting_after = intents.data[-1].id
+            else:
+                break
+
         return False
     except Exception:
         return False
