@@ -1,57 +1,62 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from fastapi import HTTPException
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-from typing import Dict, Any
-from dotenv import load_dotenv
-import pdfplumber
-import uuid
+from __future__ import annotations
+
 import os
 import re
 import json
-import stripe
-import json
+import uuid
 import time
-import secrets
 import hmac
 import hashlib
+from typing import Dict, Any, Optional
 
-def sign_doc(doc_id: str) -> str:
-    msg = doc_id.encode()
-    key = APP_SECRET.encode()
-    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:16]
+import stripe
+import pdfplumber
+from dotenv import load_dotenv
+from pydantic import BaseModel
 
-def check_sig(doc_id: str, t: str) -> bool:
-    if not t:
-        return False
-    return hmac.compare_digest(sign_doc(doc_id), t)
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
 # ================= CONFIG =================
-load_dotenv()  # lit le fichier .env en local
+load_dotenv()  # lit le fichier .env en local (Render = variables d'env)
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-APP_SECRET = os.getenv("APP_SECRET", "change-me-please")
-PRICE_CENTS = 900
-CURRENCY = "eur"
+
+APP_SECRET = os.getenv("APP_SECRET", "change-me-please")  # important: change en prod
+PRICE_CENTS = int(os.getenv("PRICE_CENTS", "900"))
+CURRENCY = os.getenv("CURRENCY", "eur")
+
+DATA_DIR = os.getenv("DATA_DIR", "./data")
+os.makedirs(DATA_DIR, exist_ok=True)
+STATE_PATH = os.path.join(DATA_DIR, "state.json")
 
 if not STRIPE_SECRET_KEY or not STRIPE_PUBLISHABLE_KEY or not STRIPE_WEBHOOK_SECRET:
-    print("⚠️ Variables Stripe manquantes. Vérifie ton fichier .env (local) ou tes variables Render (prod).")
+    print("⚠️ Variables Stripe manquantes. Vérifie .env (local) ou variables Render (prod).")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
-app = FastAPI(title="SpendGuard AI")
+app = FastAPI(title="SpendGuard AI", version="0.1.0")
 
-DATA_DIR = "./data"
-os.makedirs(DATA_DIR, exist_ok=True)
 
-STATE_PATH = os.path.join(DATA_DIR, "state.json")
+# ================= SIGNATURE LIEN (token t) =================
+def sign_doc(doc_id: str) -> str:
+    msg = doc_id.encode("utf-8")
+    key = APP_SECRET.encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:16]
 
-# ================= PERSISTENCE (DISQUE) =================
+
+def check_sig(doc_id: str, t: Optional[str]) -> bool:
+    if not t:
+        return False
+    return hmac.compare_digest(sign_doc(doc_id), t)
+
+
+# ================= PERSISTENCE DISQUE =================
 def _default_state() -> Dict[str, Any]:
-    return {"reports": {}, "paid": []}
+    return {"reports": {}, "paid": []}  # paid optionnel, on garde pour UX
+
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_PATH):
@@ -66,42 +71,47 @@ def load_state() -> Dict[str, Any]:
         save_state(s)
         return s
 
+
 def save_state(state: Dict[str, Any]) -> None:
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_PATH)
 
-def get_report(doc_id: str) -> Dict[str, Any] | None:
+
+def get_report(doc_id: str) -> Optional[Dict[str, Any]]:
     state = load_state()
-    return state["reports"].get(doc_id)
+    return state.get("reports", {}).get(doc_id)
+
 
 def set_report(doc_id: str, data: Dict[str, Any]) -> None:
     state = load_state()
-    state["reports"][doc_id] = data
+    state.setdefault("reports", {})[doc_id] = data
     save_state(state)
+
 
 def mark_paid(doc_id: str) -> None:
     state = load_state()
+    state.setdefault("paid", [])
     if doc_id not in state["paid"]:
         state["paid"].append(doc_id)
         save_state(state)
-def sign_doc(doc_id: str) -> str:
-    msg = doc_id.encode("utf-8")
-    key = APP_SECRET.encode("utf-8")
-    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:16]
 
-def check_sig(doc_id: str, t: str) -> bool:
-    if not t:
-        return False
-    return hmac.compare_digest(sign_doc(doc_id), t)
+
+# ================= STRIPE: check paiement (source: API Stripe) =================
 def is_paid(doc_id: str) -> bool:
+    """
+    Robust: vérifie sur Stripe dans les 7 derniers jours si un PaymentIntent succeeded
+    avec metadata.doc_id == doc_id
+    """
+    if not STRIPE_SECRET_KEY:
+        return False
     try:
         seven_days_ago = int(time.time()) - 7 * 24 * 3600
         starting_after = None
 
         while True:
-            params = {"limit": 100, "created": {"gte": seven_days_ago}}
+            params: Dict[str, Any] = {"limit": 100, "created": {"gte": seven_days_ago}}
             if starting_after:
                 params["starting_after"] = starting_after
 
@@ -122,7 +132,7 @@ def is_paid(doc_id: str) -> bool:
         return False
 
 
-# ================= UTILITAIRES =================
+# ================= EXTRACTION FACTURE =================
 def detect_currency(text: str) -> str:
     if "€" in text:
         return "EUR"
@@ -130,19 +140,36 @@ def detect_currency(text: str) -> str:
         return "USD"
     if "£" in text:
         return "GBP"
+    # parfois écrit
+    low = text.lower()
+    if " eur" in low or " euro" in low:
+        return "EUR"
+    if " usd" in low:
+        return "USD"
+    if " gbp" in low:
+        return "GBP"
     return "UNKNOWN"
+
+
+def normalize_vendor(v: str) -> str:
+    v = (v or "UNKNOWN").strip()
+    v = v.replace("Ia", "IA").replace("Aws", "AWS").replace("Hubspot", "HubSpot")
+    # petits nettoyages
+    v = re.sub(r"\s{2,}", " ", v)
+    return v
+
 
 def detect_vendor(raw_text: str) -> str:
     text = raw_text.strip()
     low = text.lower()
 
-    # 1) Règles simples (marques fréquentes)
     brands = [
+        ("google workspace", "Google Workspace"),
         ("google", "Google"),
-        ("workspace", "Google Workspace"),
         ("notion", "Notion"),
-        ("microsoft", "Microsoft"),
+        ("microsoft 365", "Microsoft 365"),
         ("office 365", "Microsoft 365"),
+        ("microsoft", "Microsoft"),
         ("azure", "Microsoft Azure"),
         ("adobe", "Adobe"),
         ("slack", "Slack"),
@@ -162,54 +189,45 @@ def detect_vendor(raw_text: str) -> str:
         if key in low:
             return name
 
-    # 2) Cherche une ligne "Facturé par", "Vendor", "Fournisseur", etc.
     patterns = [
         r"(factur[eé]\s*par|fournisseur|vendor|seller|issued by)\s*[:\-]\s*(.+)",
         r"(soci[eé]t[eé]|company)\s*[:\-]\s*(.+)",
     ]
     for p in patterns:
-        m = re.search(p, low, re.IGNORECASE)
+        m = re.search(p, text, re.IGNORECASE)
         if m:
             cand = m.group(m.lastindex).strip()
             cand = cand.split("\n")[0].strip()
             if 3 <= len(cand) <= 80:
-                cand = cand.title()
-                cand = cand.replace("Ia", "IA").replace("Aws", "AWS").replace("Hubspot", "HubSpot")
-                return cand
+                return normalize_vendor(cand)
 
-    # 3) Heuristique : souvent le nom est dans les 10 premières lignes
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     head = lines[:12]
-    # ignore lignes trop "génériques"
     bad = ("facture", "invoice", "date", "total", "tva", "vat", "adresse", "address")
     for l in head:
         ll = l.lower()
         if len(l) < 4 or any(b in ll for b in bad):
             continue
-        # Si ligne contient beaucoup de lettres, peu de chiffres → bon candidat
         letters = sum(c.isalpha() for c in l)
         digits = sum(c.isdigit() for c in l)
         if letters >= 6 and digits <= 2 and len(l) <= 60:
-            return l
-  
+            return normalize_vendor(l)
+
     return "UNKNOWN"
 
+
 def extract_total_amount(raw_text: str) -> float:
-    t = raw_text.replace("\u00a0", " ")  # espaces insécables
+    t = raw_text.replace("\u00a0", " ")
     low = t.lower()
 
-    # Priorité: lignes "total" / "amount due" etc.
     priority_keys = [
         "total ttc", "montant ttc", "total à payer", "net à payer",
-        "amount due", "total due", "total", "grand total"
+        "amount due", "total due", "grand total", "total"
     ]
 
     def parse_number(s: str) -> float:
-        s = s.strip()
-        s = s.replace(" ", "")
-        # 1 234,56 -> 1234.56
+        s = s.strip().replace(" ", "")
         if "," in s and "." in s:
-            # cas 1.234,56 -> on enlève les points
             if s.rfind(",") > s.rfind("."):
                 s = s.replace(".", "").replace(",", ".")
             else:
@@ -218,10 +236,9 @@ def extract_total_amount(raw_text: str) -> float:
             s = s.replace(",", ".")
         try:
             return float(s)
-        except:
+        except Exception:
             return 0.0
 
-    # Cherche une valeur sur les lignes prioritaires
     lines = [l.strip() for l in t.splitlines() if l.strip()]
     for l in lines:
         ll = l.lower()
@@ -232,14 +249,12 @@ def extract_total_amount(raw_text: str) -> float:
                 if val > 0:
                     return val
 
-    # fallback : dernier montant avec symbole ou code
     matches = re.findall(r"([0-9]{1,3}(?:[ .][0-9]{3})*(?:[.,][0-9]{2})?)\s*(€|eur|usd|\$|gbp|£)", low)
     if matches:
         val = parse_number(matches[-1][0])
         if val > 0:
             return val
 
-    # fallback 2 : dernier nombre formaté
     m2 = re.findall(r"([0-9]{1,3}(?:[ .][0-9]{3})*(?:[.,][0-9]{2}))", low)
     if m2:
         val = parse_number(m2[-1])
@@ -247,6 +262,8 @@ def extract_total_amount(raw_text: str) -> float:
 
     return 0.0
 
+
+# ================= UI SHELL =================
 def shell(title: str, inner: str) -> str:
     return f"""
     <html>
@@ -355,8 +372,6 @@ def shell(title: str, inner: str) -> str:
           border-radius: 18px;
           padding: 16px;
         }}
-        .white-panel h3 {{ margin: 0 0 10px 0; font-size: 16px; }}
-        .hint {{ font-size: 12px; color: #334155; margin-top: 8px; }}
         pre {{
           background: rgba(255,255,255,0.08);
           padding: 16px;
@@ -366,7 +381,6 @@ def shell(title: str, inner: str) -> str:
           margin:0;
         }}
         .link {{ color: #93c5fd; text-decoration: none; font-weight: 800; }}
-        .danger {{ color: #fecaca; font-size: 13px; margin-top: 10px; }}
         .row-actions {{
           display:flex;
           gap:10px;
@@ -393,9 +407,10 @@ def shell(title: str, inner: str) -> str:
     </body>
     </html>
     """
+
+
+# ================= STRIPE ELEMENTS (Payment Element) =================
 def render_stripe_checkout(doc_id: str) -> str:
-    # Stripe Elements intégré (Payment Element)
-    # Nécessite un endpoint POST /create-payment-intent qui retourne {client_secret: "..."}
     return f"""
     <div class="kpi" style="background:rgba(255,255,255,.06);">
       <div class="label">Paiement sécurisé</div>
@@ -466,6 +481,7 @@ def render_stripe_checkout(doc_id: str) -> str:
     </script>
     """
 
+
 # ================= LANDING =================
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -502,10 +518,11 @@ async def preview(
     file: UploadFile = File(...),
     company_name: str = Form(...),
     signature_name: str = Form(...),
-    tone: str = Form("Pro")
+    tone: str = Form("Pro"),
 ):
     doc_id = str(uuid.uuid4())
     path = os.path.join(DATA_DIR, f"{doc_id}_{file.filename}")
+
     content = await file.read()
     with open(path, "wb") as f:
         f.write(content)
@@ -516,25 +533,27 @@ async def preview(
             raw_parts.append(page.extract_text() or "")
 
     raw_text = "\n".join(raw_parts)
-    raw_lower = raw_text.lower()
 
-    vendor = detect_vendor(raw_text)
+    vendor = normalize_vendor(detect_vendor(raw_text))
     currency = detect_currency(raw_text)
     total = extract_total_amount(raw_text)
-    # Estimation plus “business” (plafonnée)
+
     rate = 0.10 if total < 1000 else 0.15
     savings = round(min(total * rate, 2500), 2) if total > 0 else 0.0
 
-    set_report(doc_id, {
-        "company": company_name,
-        "name": signature_name,
-        "tone": tone,
-        "vendor": vendor,
-        "currency": currency,
-        "total": total,
-        "savings": savings,
-        "filename": file.filename
-    })
+    set_report(
+        doc_id,
+        {
+            "company": company_name,
+            "name": signature_name,
+            "tone": tone,
+            "vendor": vendor,
+            "currency": currency,
+            "total": total,
+            "savings": savings,
+            "filename": file.filename,
+        },
+    )
 
     inner = f"""
       <h1>Aperçu</h1>
@@ -544,12 +563,12 @@ async def preview(
         <div>
           <div class="kpi">
             <div class="label">Montant détecté</div>
-            <div class="value">{total} {currency}</div>
+            <div class="value">{total:.2f} {currency}</div>
           </div>
 
           <div class="kpi">
             <div class="label">Économie estimée</div>
-            <div class="value green">{savings} {currency}</div>
+            <div class="value green">{savings:.2f} {currency}</div>
           </div>
 
           <div class="kpi">
@@ -574,35 +593,141 @@ async def preview(
 
       <p style="margin-top:18px;"><a class="link" href="/">← Nouvelle analyse</a></p>
     """
-    return shell("Preview", inner)
+    return shell("Aperçu", inner)
 
 
-# ================= PAIEMENT (Stripe Elements) =================
+# ================= PAY PAGE (IMPORTANT) =================
+@app.get("/pay/{doc_id}", response_class=HTMLResponse)
+def pay(doc_id: str):
+    data = get_report(doc_id)
+    if not data:
+        return shell("Erreur", "<h1>Rapport introuvable</h1><p class='muted'>Refais l’aperçu.</p>")
+
+    currency = data.get("currency", "EUR")
+    total = float(data.get("total") or 0)
+    savings = float(data.get("savings") or 0)
+    vendor = normalize_vendor(data.get("vendor") or "UNKNOWN")
+    annual = round(savings * 12, 2)
+
+    inner = f"""
+      <h1>Paiement</h1>
+      <p class="subtitle">Débloque le rapport complet. Montant : <strong>9€</strong>.</p>
+
+      <div class="stepper">
+        <div class="step"><strong>1.</strong> Aperçu ✅</div>
+        <div class="step"><strong>2.</strong> Paiement</div>
+        <div class="step"><strong>3.</strong> Rapport complet</div>
+      </div>
+
+      <div class="grid">
+        <div>
+          <div class="kpi">
+            <div class="label">Résumé</div>
+            <div class="value">{vendor}</div>
+            <div class="muted" style="margin-top:8px;">
+              Montant détecté : <b>{total:.2f} {currency}</b><br/>
+              Économie estimée : <b class="green">{savings:.2f} {currency}</b>
+            </div>
+          </div>
+
+          <div class="kpi" style="background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.25);">
+            <div class="label">Projection annuelle</div>
+            <div class="value green">{annual:.2f} {currency}</div>
+            <div class="muted" style="margin-top:6px;">(si dépense mensuelle)</div>
+          </div>
+
+          <div class="kpi">
+            <div class="label">Conseil</div>
+            <pre>🎯 Objectif : obtenir une remise
+📌 Demande : annualisation + downgrade + licences inutilisées
+⏱ Temps : 2 minutes</pre>
+          </div>
+
+          <p style="margin-top:18px;"><a class="link" href="/">← Retour</a></p>
+        </div>
+
+        <div>
+          <div class="white-panel">
+            {render_stripe_checkout(doc_id)}
+          </div>
+        </div>
+      </div>
+    """
+    return shell("Paiement", inner)
+
+
+# ================= CREATE PAYMENT INTENT =================
+class PayReq(BaseModel):
+    doc_id: str
+
+
+@app.post("/create-payment-intent")
+def create_payment_intent(req: PayReq):
+    if not get_report(req.doc_id):
+        raise HTTPException(status_code=404, detail="doc_id introuvable")
+
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe non configuré (STRIPE_SECRET_KEY manquant)")
+
+    intent = stripe.PaymentIntent.create(
+        amount=PRICE_CENTS,
+        currency=CURRENCY,
+        automatic_payment_methods={"enabled": True},
+        metadata={"doc_id": req.doc_id},
+    )
+    return JSONResponse({"client_secret": intent.client_secret})
+
+
+# ================= SUCCESS (return_url Stripe) =================
+@app.get("/success/{doc_id}", response_class=HTMLResponse)
+def success(request: Request, doc_id: str):
+    t = request.query_params.get("t")
+    if not check_sig(doc_id, t):
+        return shell("Erreur", "<h1>Lien invalide</h1><p class='muted'>Token manquant ou incorrect.</p>")
+
+    # webhook peut prendre 1-2s => on refresh
+    if not is_paid(doc_id):
+        inner = f"""
+          <h1>⏳ Paiement en cours de validation</h1>
+          <p class="subtitle">Ne ferme pas la page. Redirection automatique…</p>
+          <script>
+            setTimeout(()=>{{ window.location.reload(); }}, 1200);
+          </script>
+        """
+        return shell("Validation", inner)
+
+    mark_paid(doc_id)
+
+    inner = f"""
+      <h1>✅ Paiement confirmé</h1>
+      <p class="subtitle">Ton rapport complet est prêt.</p>
+      <a class="btn" href="/full/{doc_id}?t={t}">Ouvrir le rapport</a>
+      <p class="muted" style="margin-top:12px;">Redirection automatique…</p>
+      <script>
+        setTimeout(()=>{{ window.location.href="/full/{doc_id}?t={t}"; }}, 900);
+      </script>
+    """
+    return shell("Succès", inner)
+
+
+# ================= FULL REPORT =================
 @app.get("/full/{doc_id}", response_class=HTMLResponse)
 def full(request: Request, doc_id: str):
     data = get_report(doc_id)
     if not data:
         return shell("Erreur", "<h1>Rapport introuvable</h1><p class='muted'>Refais l’aperçu.</p>")
 
-    # ✅ vérif token signé
     t = request.query_params.get("t")
     if not check_sig(doc_id, t):
-        return shell(
-            "Lien invalide",
-            "<h1>Lien invalide</h1><p class='muted'>Reviens via le lien reçu après paiement.</p>"
-        )
+        return shell("Lien invalide", "<h1>Lien invalide</h1><p class='muted'>Reviens via le lien après paiement.</p>")
 
-    # ✅ vérif paiement
     if not is_paid(doc_id):
         return shell(
             "Accès verrouillé",
             f"<h1>Accès verrouillé</h1><p class='muted'>Paiement requis.</p><a class='btn' href='/pay/{doc_id}'>Payer 9€</a>",
         )
 
-    # Normalisation vendor
-    vendor = (data.get("vendor") or "UNKNOWN")
-    vendor = vendor.replace("Ia", "IA").replace("Aws", "AWS")
-
+    vendor = normalize_vendor(data.get("vendor") or "UNKNOWN")
     currency = data.get("currency", "EUR")
     total = float(data.get("total") or 0)
     savings = float(data.get("savings") or 0)
@@ -622,9 +747,7 @@ Cordialement,
 
     inner = f"""
       <h1>Rapport complet</h1>
-      <p style="opacity:0.7;font-size:14px;">
-        Analyse IA basée sur optimisation SaaS B2B (benchmark 2026)
-      </p>
+      <p style="opacity:0.7;font-size:14px;">Analyse IA basée sur optimisation SaaS B2B (benchmark 2026)</p>
       <p class="subtitle">Email prêt à envoyer + export PDF.</p>
 
       <div class="grid">
@@ -695,187 +818,7 @@ Cordialement,
     return shell("Rapport complet", inner)
 
 
-# ================= CREATE PAYMENT INTENT =================
-class PayReq(BaseModel):
-    doc_id: str
-
-@app.post("/create-payment-intent")
-def create_payment_intent(req: PayReq):
-    if not get_report(req.doc_id):
-        raise HTTPException(status_code=404, detail="doc_id introuvable")
-
-    intent = stripe.PaymentIntent.create(
-        amount=PRICE_CENTS,
-        currency=CURRENCY,
-        automatic_payment_methods={"enabled": True},
-        metadata={"doc_id": req.doc_id}
-    )
-    return JSONResponse({"client_secret": intent.client_secret})
-
-
-# ================= RETOUR APRÈS PAIEMENT =================
-@app.get("/paid/{doc_id}", response_class=HTMLResponse)
-def paid(doc_id: str, payment_intent: str = ""):
-    # Ici on vérifie en direct + on laisse le webhook faire foi aussi.
-    if not payment_intent:
-        return shell("Erreur", "<h1>Paiement non confirmé</h1><p class='muted'>Paramètre payment_intent manquant.</p>")
-
-    pi = stripe.PaymentIntent.retrieve(payment_intent)
-    if pi.status == "succeeded":
-        # Déverrouille immédiatement (UX), même si webhook arrive après.
-        mark_paid(doc_id)
-        return RedirectResponse(f"/full/{doc_id}")
-
-    return shell("Paiement", f"<h1>Paiement incomplet</h1><p class='muted'>Statut: {pi.status}</p><a class='btn' href='/pay/{doc_id}'>Réessayer</a>")
-
-
-# ================= WEBHOOK STRIPE (SOURCE DE VÉRITÉ) =================
-@app.post("/stripe/webhook")
-async def stripe_webhook(request: Request):
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-
-    if not sig_header:
-        raise HTTPException(status_code=400, detail="Missing Stripe-Signature header")
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload=payload,
-            sig_header=sig_header,
-            secret=STRIPE_WEBHOOK_SECRET
-        )
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-
-    # Événements importants
-    event_type = event.get("type", "")
-    obj = event["data"]["object"]
-
-    # PaymentIntent OK → on déverrouille
-    if event_type in ("payment_intent.succeeded",):
-        doc_id = (obj.get("metadata") or {}).get("doc_id")
-        if doc_id:
-            mark_paid(doc_id)
-
-    # Optionnel: gérer un paiement échoué
-    # if event_type == "payment_intent.payment_failed": ...
-
-    return {"received": True}
-
-
-# ================= RAPPORT COMPLET (+ COPY + PDF) =================
-@app.get("/full/{doc_id}", response_class=HTMLResponse)
-def full(doc_id: str):
-    data = get_report(doc_id)
-    if not data:
-        return shell("Erreur", "<h1>Rapport introuvable</h1><p class='muted'>Refais l’aperçu.</p>")
-
-    if not is_paid(doc_id):
-        return shell(
-            "Accès verrouillé",
-            f"<h1>Accès verrouillé</h1><p class='muted'>Paiement requis.</p><a class='btn' href='/pay/{doc_id}'>Payer 9€</a>",
-        )
-
-    # Normalisation vendor (petite finition)
-    vendor = (data.get("vendor") or "UNKNOWN")
-    vendor = vendor.replace("Ia", "IA").replace("Aws", "AWS")
-
-    currency = data.get("currency", "EUR")
-    total = float(data.get("total") or 0)
-    savings = float(data.get("savings") or 0)
-    annual = round(savings * 12, 2)
-
-    subject = f"Demande d’amélioration tarifaire - {data['company']}"
-    body = f"""Bonjour,
-
-Nous utilisons {vendor}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
-Avez-vous une remise annuelle, une offre fidélité, ou un plan plus adapté ?
-
-Cordialement,
-{data['name']}"""
-
-    email_text = f"Sujet: {subject}\n\n{body}"
-    # IMPORTANT: JSON stringify pour éviter les bugs JS (apostrophes, retours ligne, etc.)
-    email_text_js = json.dumps(email_text)
-
-    inner = f"""
-      <h1>Rapport complet</h1>
-      <p style="opacity:0.7;font-size:14px;">
-        Analyse IA basée sur optimisation SaaS B2B (benchmark 2026)
-      </p>
-      <p class="subtitle">Email prêt à envoyer + export PDF.</p>
-
-      <div class="grid">
-        <div>
-          <div class="kpi">
-            <div class="label">Montant</div>
-            <div class="value">{total:.2f} {currency}</div>
-          </div>
-
-          <div class="kpi">
-            <div class="label">Économie estimée</div>
-            <div class="value green">{savings:.2f} {currency}</div>
-          </div>
-
-          <div class="kpi" style="background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.25);">
-            <div class="label">Projection annuelle</div>
-            <div class="value green">{annual:.2f} {currency}</div>
-            <div class="muted" style="margin-top:6px;">(si cette dépense est mensuelle)</div>
-          </div>
-
-          <div class="kpi">
-            <div class="label">Fournisseur</div>
-            <div class="value">{vendor}</div>
-          </div>
-
-          <div class="kpi">
-            <div class="label">Checklist</div>
-            <pre>✅ Envoyer l’email
-✅ Demander remise annuelle / downgrade
-✅ Vérifier licences inutilisées
-✅ Revue mensuelle des abonnements</pre>
-          </div>
-
-          <div class="row-actions">
-            <button class="btn btn-secondary" id="copyBtn">Copier l’email</button>
-            <a class="btn" href="/print/{doc_id}" target="_blank">Télécharger PDF</a>
-          </div>
-
-          <p class="muted" id="copyMsg" style="margin-top:10px;"></p>
-        </div>
-
-        <div>
-          <div class="kpi">
-            <div class="label">Email prêt</div>
-            <pre id="emailBlock">Sujet: {subject}
-
-{body}</pre>
-          </div>
-        </div>
-      </div>
-
-      <script>
-        const emailText = {email_text_js};
-        const btn = document.getElementById("copyBtn");
-        const msg = document.getElementById("copyMsg");
-        btn.addEventListener("click", async () => {{
-          try {{
-            await navigator.clipboard.writeText(emailText);
-            msg.textContent = "✅ Email copié dans le presse-papier.";
-          }} catch (e) {{
-            msg.textContent = "⚠️ Copie automatique refusée. Sélectionne le texte et copie manuellement.";
-          }}
-        }});
-      </script>
-
-      <p style="margin-top:18px;"><a class="link" href="/">← Nouvelle analyse</a></p>
-    """
-    return shell("Rapport complet", inner)
-
-
-# ================= PAGE PRINT (PDF) =================
+# ================= PRINT VIEW (PDF navigateur) =================
 @app.get("/print/{doc_id}", response_class=HTMLResponse)
 def print_view(request: Request, doc_id: str):
     t = request.query_params.get("t")
@@ -888,9 +831,7 @@ def print_view(request: Request, doc_id: str):
     if not is_paid(doc_id):
         return HTMLResponse("Paiement requis", status_code=403)
 
-    vendor = (data.get("vendor") or "UNKNOWN")
-    vendor = vendor.replace("Ia", "IA").replace("Aws", "AWS")
-
+    vendor = normalize_vendor(data.get("vendor") or "UNKNOWN")
     currency = data.get("currency", "EUR")
     total = float(data.get("total") or 0)
     savings = float(data.get("savings") or 0)
@@ -984,12 +925,46 @@ Cordialement,
     </body>
     </html>
     """
+
+
+# ================= STRIPE WEBHOOK =================
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    if not sig_header:
+        raise HTTPException(status_code=400, detail="Missing Stripe-Signature header")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=sig_header,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    event_type = event.get("type", "")
+    obj = event["data"]["object"]
+
+    if event_type == "payment_intent.succeeded":
+        doc_id = (obj.get("metadata") or {}).get("doc_id")
+        if doc_id:
+            mark_paid(doc_id)
+
+    return {"received": True}
+
+
+# ================= HEALTH =================
 @app.get("/health")
 def health():
     return {"status": "running"}
 
-from fastapi.responses import HTMLResponse
 
+# ================= PAGES OPTIONNELLES (templates) =================
 @app.get("/pricing", response_class=HTMLResponse)
 def pricing():
     try:
@@ -997,6 +972,7 @@ def pricing():
             return f.read()
     except FileNotFoundError:
         return "<h1>pricing.html manquant</h1>"
+
 
 @app.get("/example", response_class=HTMLResponse)
 def example():
