@@ -5,3 +5,4 @@ pdfplumber
 stripe
 python-dotenv
 pydantic
+httpx

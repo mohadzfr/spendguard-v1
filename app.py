@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 import pdfplumber
 import uuid
@@ -12,7 +12,7 @@ import stripe
 import time
 import hmac
 import hashlib
-from fastapi.responses import RedirectResponse
+import httpx
 
 
 # ================= CONFIG =================
@@ -23,15 +23,19 @@ STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 APP_SECRET = os.getenv("APP_SECRET", "change-me-please")
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+AI_MODEL = os.getenv("AI_MODEL", "gpt-4.1-mini")  # exemple
+AI_ENABLED = bool(OPENAI_API_KEY)
+
 PRICE_CENTS = int(os.getenv("PRICE_CENTS", "900"))
 CURRENCY = os.getenv("CURRENCY", "eur")
 
 if not STRIPE_SECRET_KEY or not STRIPE_PUBLISHABLE_KEY or not STRIPE_WEBHOOK_SECRET:
-    print("⚠️ Variables Stripe manquantes. Vérifie .env (local) ou Render env vars (prod).")
+    print("⚠️ Variables Stripe manquantes. Vérifie .env (local) ou env vars Render (prod).")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
-app = FastAPI(title="SpendGuard AI", version="1.1.0")
+app = FastAPI(title="SpendGuard AI", version="2.0.0")
 
 DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -50,9 +54,9 @@ def check_sig(doc_id: str, t: Optional[str]) -> bool:
     return hmac.compare_digest(sign_doc(doc_id), t)
 
 
-# ================= STATE.JSON =================
+# ================= STATE (state.json) =================
 def _default_state() -> Dict[str, Any]:
-    return {"reports": {}, "paid": {}}
+    return {"reports": {}, "paid": {}}  # paid: {doc_id: {"ts": int, "payment_intent": str}}
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_PATH):
@@ -62,12 +66,13 @@ def load_state() -> Dict[str, Any]:
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if "paid" in data and isinstance(data["paid"], list):
-            data["paid"] = {doc_id: {"ts": int(time.time()), "payment_intent": ""} for doc_id in data["paid"]}
-        if "paid" not in data or not isinstance(data["paid"], dict):
-            data["paid"] = {}
+
+        # migrations soft
         if "reports" not in data or not isinstance(data["reports"], dict):
             data["reports"] = {}
+        if "paid" not in data or not isinstance(data["paid"], dict):
+            data["paid"] = {}
+
         return data
     except Exception:
         s = _default_state()
@@ -105,25 +110,33 @@ def is_paid_local(doc_id: str, ttl_days: int = 7) -> bool:
     return ts >= int(time.time()) - ttl_days * 24 * 3600
 
 def is_paid(doc_id: str) -> bool:
+    # 1) local state first (fast)
     if is_paid_local(doc_id):
         return True
+
+    # 2) fallback stripe scan (useful if state reset)
     try:
         seven_days_ago = int(time.time()) - 7 * 24 * 3600
         starting_after = None
+
         while True:
             params = {"limit": 100, "created": {"gte": seven_days_ago}}
             if starting_after:
                 params["starting_after"] = starting_after
+
             intents = stripe.PaymentIntent.list(**params)
+
             for pi in intents.data:
                 md = pi.metadata or {}
                 if md.get("doc_id") == doc_id and pi.status == "succeeded":
                     mark_paid(doc_id, payment_intent=pi.id)
                     return True
+
             if intents.has_more and intents.data:
                 starting_after = intents.data[-1].id
             else:
                 break
+
         return False
     except Exception:
         return False
@@ -251,7 +264,172 @@ def extract_total_amount(raw_text: str) -> float:
     return 0.0
 
 
-# ================= UI SHELL (UX BOOST) =================
+# ================= IA AUDIT (OpenAI via httpx) =================
+async def ai_audit_from_text(
+    raw_text: str,
+    company: str,
+    signer: str,
+    tone: str,
+    fallback_vendor: str,
+    currency: str,
+    total: float,
+) -> Dict[str, Any]:
+    """
+    Analyse IA achats B2B:
+    - insights / opportunities / questions
+    - email vraiment adapté
+    Retourne JSON strict.
+    """
+    fallback_vendor = normalize_vendor(fallback_vendor)
+
+    if not AI_ENABLED:
+        return {
+            "ai_used": False,
+            "confidence": 0.25,
+            "vendor": fallback_vendor,
+            "category": "unknown",
+            "insights": [
+                "Analyse IA désactivée (OPENAI_API_KEY absent)."
+            ],
+            "opportunities": [
+                {"title": "Négociation", "why": "Dépense détectée, tenter une remise annuelle.", "impact_estimate": "5–15%"}
+            ],
+            "questions": [
+                "Avez-vous une remise annuelle ?",
+                "Pouvons-nous réduire le nombre de licences ?",
+                "Existe-t-il un plan moins cher (downgrade) ?"
+            ],
+            "email_subject": f"Demande d’amélioration tarifaire - {company}",
+            "email_body": f"""Bonjour,
+
+Nous utilisons {fallback_vendor}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
+Avez-vous une remise annuelle, une offre fidélité, ou un plan plus adapté ?
+
+Cordialement,
+{signer}""",
+        }
+
+    raw_text = (raw_text or "").strip()
+
+    # Limiter le texte envoyé pour coûts/perf:
+    head = raw_text[:6000]
+    tail = raw_text[-2500:] if len(raw_text) > 8000 else ""
+    packed = head + ("\n\n--- FIN DU DOCUMENT ---\n\n" + tail if tail else "")
+
+    system = (
+        "Tu es un expert achats B2B (SaaS, cloud, licences) et négociation fournisseur. "
+        "Tu analyses une facture/contrat (texte brut) et produis un audit actionnable. "
+        "Tu n'inventes pas: si une info n'est pas présente, tu le dis. "
+        "Tu réponds UNIQUEMENT par un JSON strict."
+    )
+
+    user = f"""
+CONTEXTE:
+- Entreprise cliente: {company}
+- Signataire: {signer}
+- Ton souhaité: {tone}
+- Fournisseur détecté (fallback): {fallback_vendor}
+- Montant détecté: {total} {currency}
+
+TEXTE FACTURE (extrait):
+{packed}
+
+TÂCHE:
+1) Identifier le fournisseur réel si possible (sinon fallback).
+2) Déduire la catégorie (CRM, cloud, design, dev tools, etc.) si possible.
+3) Repérer ce qui est utile: périodicité, engagement, renouvellement, quantités, licences, dates, TVA, etc.
+4) Donner:
+   - confidence (0 à 1)
+   - insights (liste bullet: ce qui est vrai/observé ou incertain)
+   - opportunities (liste: title + why + impact_estimate)
+   - questions (questions concrètes à poser)
+5) Rédiger un email de négociation TRÈS PRO adapté à ce document.
+   - email_subject
+   - email_body
+
+RENVOIE STRICTEMENT CE JSON:
+{{
+  "ai_used": true,
+  "confidence": 0.0,
+  "vendor": "string",
+  "category": "string",
+  "insights": ["..."],
+  "opportunities": [{{"title":"...","why":"...","impact_estimate":"..."}}],
+  "questions": ["..."],
+  "email_subject": "string",
+  "email_body": "string"
+}}
+"""
+
+    payload = {
+        "model": AI_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.3,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                json=payload,
+            )
+            r.raise_for_status()
+            data = r.json()
+            content = data["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+
+        parsed.setdefault("ai_used", True)
+        parsed.setdefault("confidence", 0.4)
+        parsed.setdefault("vendor", fallback_vendor)
+        parsed.setdefault("category", "unknown")
+        parsed.setdefault("insights", [])
+        parsed.setdefault("opportunities", [])
+        parsed.setdefault("questions", [])
+        parsed.setdefault("email_subject", f"Demande d’amélioration tarifaire - {company}")
+        parsed.setdefault("email_body", "")
+
+        parsed["vendor"] = normalize_vendor(parsed.get("vendor") or fallback_vendor)
+
+        # hard limits (avoid insanely long outputs)
+        parsed["insights"] = (parsed.get("insights") or [])[:12]
+        parsed["opportunities"] = (parsed.get("opportunities") or [])[:10]
+        parsed["questions"] = (parsed.get("questions") or [])[:10]
+        if len(parsed.get("email_body") or "") > 3500:
+            parsed["email_body"] = (parsed["email_body"][:3400] + "\n\nCordialement,\n" + signer)
+
+        return parsed
+
+    except Exception as e:
+        return {
+            "ai_used": False,
+            "confidence": 0.2,
+            "vendor": fallback_vendor,
+            "category": "unknown",
+            "insights": [f"Erreur IA: {str(e)}"],
+            "opportunities": [
+                {"title": "Négociation", "why": "Dépense détectée, tenter une remise.", "impact_estimate": "5–15%"}
+            ],
+            "questions": [
+                "Avez-vous une remise annuelle ?",
+                "Pouvons-nous réduire le nombre de licences ?",
+                "Existe-t-il un plan moins cher (downgrade) ?"
+            ],
+            "email_subject": f"Demande d’amélioration tarifaire - {company}",
+            "email_body": f"""Bonjour,
+
+Nous utilisons {fallback_vendor}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
+
+Cordialement,
+{signer}""",
+        }
+
+
+# ================= UI SHELL / DESIGN =================
 def shell(title: str, inner: str, wide: bool = False) -> str:
     maxw = "1100px" if wide else "980px"
     return f"""
@@ -274,7 +452,6 @@ def shell(title: str, inner: str, wide: bool = False) -> str:
           --amber:#fbbf24;
           --shadow: 0 25px 70px rgba(0,0,0,0.55);
         }}
-
         body {{
           margin:0;
           font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
@@ -288,164 +465,45 @@ def shell(title: str, inner: str, wide: bool = False) -> str:
           align-items:flex-start;
           padding:44px 14px;
         }}
-
         .container {{ width:100%; max-width:{maxw}; }}
-        .topbar {{
-          display:flex; align-items:center; justify-content:space-between;
-          margin-bottom:18px;
-        }}
-        .brand {{
-          display:flex; align-items:center; gap:10px;
-          font-weight:900; letter-spacing:-0.6px; font-size:18px;
-        }}
-        .dot {{
-          width:10px; height:10px; border-radius:999px;
-          background: linear-gradient(90deg, var(--brand1), var(--brand2));
-          box-shadow: 0 10px 30px rgba(99,102,241,0.45);
-        }}
-        .pill {{
-          font-size:12px; color:#0b1020; background: rgba(34,197,94,0.95);
-          padding:6px 10px; border-radius: 999px; font-weight:900;
-        }}
-
-        .card {{
-          background: var(--card);
-          border:1px solid var(--border);
-          border-radius: 22px;
-          box-shadow: var(--shadow);
-          padding: 26px;
-        }}
-
+        .topbar {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }}
+        .brand {{ display:flex; align-items:center; gap:10px; font-weight:900; letter-spacing:-0.6px; font-size:18px; }}
+        .dot {{ width:10px; height:10px; border-radius:999px; background: linear-gradient(90deg, var(--brand1), var(--brand2)); box-shadow: 0 10px 30px rgba(99,102,241,0.45); }}
+        .pill {{ font-size:12px; color:#0b1020; background: rgba(34,197,94,0.95); padding:6px 10px; border-radius: 999px; font-weight:900; }}
+        .card {{ background: var(--card); border:1px solid var(--border); border-radius: 22px; box-shadow: var(--shadow); padding: 26px; }}
         h1 {{ margin: 0 0 8px 0; font-size: 30px; letter-spacing:-0.8px; }}
         .subtitle {{ margin:0 0 18px 0; color: var(--muted); font-size:14px; line-height:1.45; }}
-
         .grid {{ display:grid; grid-template-columns: 1.1fr 0.9fr; gap:18px; }}
         @media (max-width: 920px) {{ .grid {{ grid-template-columns: 1fr; }} }}
-
-        .hero {{
-          display:grid;
-          grid-template-columns: 1.3fr 0.7fr;
-          gap:18px;
-          align-items:start;
-        }}
+        .hero {{ display:grid; grid-template-columns: 1.3fr 0.7fr; gap:18px; align-items:start; }}
         @media (max-width: 920px) {{ .hero {{ grid-template-columns: 1fr; }} }}
-
-        .kpi {{
-          border:1px solid var(--border);
-          background: rgba(255,255,255,0.04);
-          border-radius: 18px;
-          padding: 16px;
-          margin-top: 10px;
-        }}
+        .kpi {{ border:1px solid var(--border); background: rgba(255,255,255,0.04); border-radius: 18px; padding: 16px; margin-top: 10px; }}
         .kpi .label {{ color: var(--muted); font-size: 12px; margin-bottom: 6px; }}
         .kpi .value {{ font-size: 22px; font-weight: 900; letter-spacing:-0.5px; }}
         .green {{ color: var(--green); }}
-
-        .btn {{
-          display:inline-block;
-          width:100%;
-          padding:14px;
-          border-radius: 14px;
-          border:none;
-          background: linear-gradient(90deg, var(--brand1), var(--brand2));
-          color:white;
-          font-weight:900;
-          cursor:pointer;
-          text-align:center;
-          text-decoration:none;
-          transition:0.2s;
-          margin-top:10px;
-        }}
+        .btn {{ display:inline-block; width:100%; padding:14px; border-radius: 14px; border:none; background: linear-gradient(90deg, var(--brand1), var(--brand2)); color:white; font-weight:900; cursor:pointer; text-align:center; text-decoration:none; transition:0.2s; margin-top:10px; }}
         .btn:hover {{ transform: translateY(-2px); box-shadow: 0 12px 28px rgba(99,102,241,0.35); }}
-        .btn-secondary {{
-          background: rgba(255,255,255,0.08);
-          border: 1px solid var(--border);
-        }}
-
-        input, select {{
-          width:100%;
-          padding:12px 12px;
-          margin:10px 0;
-          border-radius:12px;
-          border:1px solid var(--border);
-          background: rgba(255,255,255,0.07);
-          color: var(--text);
-          outline:none;
-        }}
-
+        .btn-secondary {{ background: rgba(255,255,255,0.08); border: 1px solid var(--border); }}
+        input, select {{ width:100%; padding:12px 12px; margin:10px 0; border-radius:12px; border:1px solid var(--border); background: rgba(255,255,255,0.07); color: var(--text); outline:none; }}
         .muted {{ color: var(--muted); font-size: 13px; }}
-        .row-actions {{
-          display:flex; gap:10px; flex-wrap:wrap; margin-top:12px;
-        }}
-        .row-actions .btn {{
-          width:auto; flex:1; min-width:220px;
-        }}
-
-        pre {{
-          background: rgba(255,255,255,0.08);
-          padding: 16px;
-          border-radius: 14px;
-          white-space: pre-wrap;
-          border: 1px solid var(--border);
-          margin:0;
-        }}
-
+        .row-actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }}
+        .row-actions .btn {{ width:auto; flex:1; min-width:220px; }}
+        pre {{ background: rgba(255,255,255,0.08); padding: 16px; border-radius: 14px; white-space: pre-wrap; border: 1px solid var(--border); margin:0; }}
         .link {{ color: #93c5fd; text-decoration: none; font-weight: 900; }}
-
-        .badge {{
-          display:inline-flex; align-items:center; gap:8px;
-          padding:8px 10px;
-          border:1px solid var(--border);
-          border-radius:999px;
-          background: rgba(255,255,255,0.04);
-          color: var(--muted);
-          font-size:12px;
-          font-weight:900;
-        }}
+        .badge {{ display:inline-flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--border); border-radius:999px; background: rgba(255,255,255,0.04); color: var(--muted); font-size:12px; font-weight:900; }}
         .badge b {{ color: var(--text); }}
-
-        .feature {{
-          border:1px solid var(--border);
-          background: rgba(255,255,255,0.03);
-          border-radius: 18px;
-          padding: 16px;
-        }}
+        .feature {{ border:1px solid var(--border); background: rgba(255,255,255,0.03); border-radius: 18px; padding: 16px; }}
         .feature h3 {{ margin:0 0 6px 0; font-size: 15px; }}
         .feature p {{ margin:0; color: var(--muted); font-size: 13px; line-height:1.4; }}
-
-        .faq {{
-          border:1px solid var(--border);
-          border-radius: 18px;
-          padding: 14px 16px;
-          background: rgba(255,255,255,0.03);
-        }}
-        .faq summary {{
-          cursor:pointer;
-          font-weight: 900;
-          color: var(--text);
-          list-style:none;
-        }}
+        .faq {{ border:1px solid var(--border); border-radius: 18px; padding: 14px 16px; background: rgba(255,255,255,0.03); }}
+        .faq summary {{ cursor:pointer; font-weight: 900; color: var(--text); list-style:none; }}
         .faq summary::-webkit-details-marker {{ display:none; }}
         .faq p {{ margin:10px 0 0 0; color: var(--muted); font-size: 13px; line-height:1.5; }}
-
-        .notice {{
-          margin-top:12px;
-          padding:12px 14px;
-          border:1px solid rgba(251,191,36,0.35);
-          background: rgba(251,191,36,0.10);
-          border-radius: 16px;
-          color: #fde68a;
-          font-size: 13px;
-          line-height:1.45;
-        }}
-
-        .white-panel {{
-          background: #ffffff;
-          color: #0b1020;
-          border-radius: 18px;
-          padding: 18px;
-        }}
+        .notice {{ margin-top:12px; padding:12px 14px; border:1px solid rgba(251,191,36,0.35); background: rgba(251,191,36,0.10); border-radius: 16px; color: #fde68a; font-size: 13px; line-height:1.45; }}
+        .white-panel {{ background: #ffffff; color: #0b1020; border-radius: 18px; padding: 18px; }}
         .white-panel h3 {{ margin: 0 0 10px 0; font-size: 16px; }}
+        ul {{ margin: 8px 0 0 18px; padding: 0; }}
+        li {{ margin: 6px 0; }}
       </style>
     </head>
     <body>
@@ -463,8 +521,7 @@ def shell(title: str, inner: str, wide: bool = False) -> str:
     """
 
 
-# ================= OPTION B: LANDING CONVERSION =================
-
+# ================= ROUTES CONVERSION =================
 @app.get("/", response_class=HTMLResponse)
 def root():
     return RedirectResponse("/pricing")
@@ -477,18 +534,17 @@ def pricing():
         <div>
           <h1>Stop payer trop cher tes SaaS.</h1>
           <p class="subtitle">
-            Upload une facture PDF → on détecte le fournisseur & le montant → on génère un <b>email de négociation</b>
-            + checklist + export PDF. Résultat en 30 secondes.
+            Upload une facture PDF → l’agent IA détecte les opportunités → il génère un <b>email</b> + une <b>stratégie</b> + un <b>rapport PDF</b>.
           </p>
 
           <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;">
             <span class="badge">⚡ <b>30 sec</b> par audit</span>
-            <span class="badge">📉 <b>10–15%</b> d’économies typiques</span>
-            <span class="badge">🔒 <b>Paiement</b> Stripe</span>
+            <span class="badge">📉 <b>5–15%</b> d’économies</span>
+            <span class="badge">🤖 <b>IA</b> + score confiance</span>
           </div>
 
           <div class="notice">
-            <b>Astuce conversion :</b> commence par voir un exemple, puis teste avec ta facture.
+            <b>Valeur :</b> un livrable “achats” complet, pas juste un mail.
           </div>
 
           <div class="row-actions" style="margin-top:16px;">
@@ -498,37 +554,36 @@ def pricing():
 
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px;">
             <div class="feature">
-              <h3>✅ Email prêt à envoyer</h3>
-              <p>Texte clair, pro, orienté “remise annuelle / downgrade / licences inutilisées”.</p>
+              <h3>✅ Analyse IA réelle</h3>
+              <p>Insights, opportunités, questions à poser, stratégie.</p>
             </div>
             <div class="feature">
-              <h3>✅ Export PDF “rapport”</h3>
-              <p>Format clean pour ton dossier achats ou ton boss.</p>
+              <h3>✅ Email ultra adapté</h3>
+              <p>Basé sur le document, pas un template fixe.</p>
             </div>
             <div class="feature">
-              <h3>✅ Checklist actionnable</h3>
-              <p>Le plan simple pour récupérer de l’argent rapidement.</p>
+              <h3>✅ Rapport PDF pro</h3>
+              <p>Pour archiver / envoyer à ton boss / achats.</p>
             </div>
             <div class="feature">
-              <h3>✅ Confidentialité</h3>
-              <p>On traite juste ton PDF pour extraire montant/fournisseur (MVP).</p>
+              <h3>✅ Paiement sécurisé</h3>
+              <p>Stripe (Payment Element).</p>
             </div>
           </div>
 
           <h2 style="margin-top:22px;font-size:18px;margin-bottom:10px;">FAQ</h2>
-
           <div style="display:grid;gap:10px;">
             <details class="faq">
-              <summary>Ça marche avec toutes les factures ?</summary>
-              <p>Ça marche déjà bien sur les PDF “classiques”. Si ton PDF est une image scannée, l’extraction peut être moins fiable (on pourra ajouter OCR ensuite).</p>
+              <summary>Est-ce vraiment une IA ?</summary>
+              <p>Oui. L’agent IA lit le texte extrait du PDF et retourne un audit structuré + email adapté + score de confiance.</p>
             </details>
             <details class="faq">
-              <summary>Pourquoi je paie {price} ?</summary>
-              <p>L’aperçu est gratuit. Le paiement débloque le rapport complet (email + checklist + PDF). Stripe sécurise le paiement.</p>
+              <summary>Pourquoi payer {price} ?</summary>
+              <p>L’aperçu est gratuit. Le paiement débloque le rapport complet + PDF export + contenu copiable en 1 clic.</p>
             </details>
             <details class="faq">
-              <summary>Et si le fournisseur est mal détecté ?</summary>
-              <p>Pas grave : le rapport reste utile. On ajoute ensuite une correction manuelle et une meilleure détection.</p>
+              <summary>Si le PDF est scanné (image) ?</summary>
+              <p>Selon la qualité, l’extraction peut être limitée. Étape suivante: OCR (plus tard).</p>
             </details>
           </div>
         </div>
@@ -556,11 +611,8 @@ def pricing():
     """
     return shell("SpendGuard — Pricing", inner, wide=True)
 
-
-# ================= EXEMPLE RAPPORT (CONVERSION) =================
 @app.get("/example", response_class=HTMLResponse)
 def example():
-    # Exemple statique — rassure et augmente conversion
     vendor = "Microsoft 365"
     company = "Exemple SARL"
     name = "Mohamed"
@@ -569,18 +621,37 @@ def example():
     savings = 81.00
     annual = round(savings * 12, 2)
 
+    insights = [
+        "Service identifié : suite bureautique / licences utilisateurs.",
+        "Montant mensuel probable (à confirmer selon périodicité).",
+        "Opportunités : annualisation + réduction licences."
+    ]
+    opps = [
+        {"title":"Annualisation", "why":"Demander un prix annuel réduit.", "impact_estimate":"5–12%"},
+        {"title":"Downgrade", "why":"Réduire le plan si fonctions inutiles.", "impact_estimate":"jusqu’à 20%"},
+    ]
+    questions = [
+        "Pouvez-vous proposer une remise annuelle ?",
+        "Existe-t-il un plan inférieur adapté ?",
+        "Pouvons-nous réduire le nombre de licences ?"
+    ]
+
     subject = f"Demande d’amélioration tarifaire - {company}"
     body = f"""Bonjour,
 
 Nous utilisons {vendor}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
-Avez-vous une remise annuelle, une offre fidélité, ou un plan plus adapté ?
+Serait-il possible d’obtenir une remise annuelle ou un plan plus adapté à notre usage actuel ?
 
 Cordialement,
 {name}"""
 
+    insights_html = "".join([f"<li>{i}</li>" for i in insights])
+    opps_html = "".join([f"<li><b>{o['title']}</b> — {o['why']} <span class='muted'>({o['impact_estimate']})</span></li>" for o in opps])
+    q_html = "".join([f"<li>{q}</li>" for q in questions])
+
     inner = f"""
       <h1>Exemple de rapport</h1>
-      <p class="subtitle">Voici exactement ce que tu obtiens après paiement : KPI + email prêt + PDF.</p>
+      <p class="subtitle">Voici exactement ce que tu obtiens après paiement : analyse IA, opportunités, questions, email prêt + PDF.</p>
 
       <div class="grid">
         <div>
@@ -588,24 +659,25 @@ Cordialement,
             <div class="label">Montant</div>
             <div class="value">{total:.2f} {currency}</div>
           </div>
-
           <div class="kpi">
             <div class="label">Économie estimée</div>
             <div class="value green">{savings:.2f} {currency}</div>
           </div>
-
           <div class="kpi" style="background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.25);">
             <div class="label">Projection annuelle</div>
             <div class="value green">{annual:.2f} {currency}</div>
-            <div class="muted" style="margin-top:6px;">(si cette dépense est mensuelle)</div>
           </div>
-
           <div class="kpi">
-            <div class="label">Checklist</div>
-            <pre>✅ Envoyer l’email
-✅ Demander remise annuelle / downgrade
-✅ Vérifier licences inutilisées
-✅ Revue mensuelle des abonnements</pre>
+            <div class="label">Ce que l’IA a compris</div>
+            <ul>{insights_html}</ul>
+          </div>
+          <div class="kpi">
+            <div class="label">Opportunités détectées</div>
+            <ul>{opps_html}</ul>
+          </div>
+          <div class="kpi">
+            <div class="label">Questions à poser</div>
+            <ul>{q_html}</ul>
           </div>
 
           <div class="row-actions">
@@ -637,6 +709,7 @@ async def preview(
 ):
     doc_id = str(uuid.uuid4())
     path = os.path.join(DATA_DIR, f"{doc_id}_{file.filename}")
+
     content = await file.read()
     with open(path, "wb") as f:
         f.write(content)
@@ -648,30 +721,66 @@ async def preview(
 
     raw_text = "\n".join(raw_parts)
 
-    vendor = normalize_vendor(detect_vendor(raw_text))
+    vendor_guess = normalize_vendor(detect_vendor(raw_text))
     currency = detect_currency(raw_text)
     total = extract_total_amount(raw_text)
 
+    # baseline savings (simple)
     rate = 0.10 if total < 1000 else 0.15
     savings = round(min(total * rate, 2500), 2) if total > 0 else 0.0
+
+    # IA audit
+    ai = await ai_audit_from_text(
+        raw_text=raw_text,
+        company=company_name,
+        signer=signature_name,
+        tone=tone,
+        fallback_vendor=vendor_guess,
+        currency=currency,
+        total=total,
+    )
+
+    vendor_final = normalize_vendor(ai.get("vendor") or vendor_guess)
+    category = ai.get("category") or "unknown"
+    confidence = float(ai.get("confidence") or 0.3)
+    ai_used = bool(ai.get("ai_used"))
+    insights: List[str] = ai.get("insights") or []
+    opps: List[Dict[str, str]] = ai.get("opportunities") or []
+    questions: List[str] = ai.get("questions") or []
+    email_subject = ai.get("email_subject") or f"Demande d’amélioration tarifaire - {company_name}"
+    email_body = ai.get("email_body") or ""
 
     set_report(doc_id, {
         "company": company_name,
         "name": signature_name,
         "tone": tone,
-        "vendor": vendor,
+        "vendor": vendor_final,
         "currency": currency,
         "total": total,
         "savings": savings,
         "filename": file.filename,
         "created_ts": int(time.time()),
+
+        # IA payload
+        "ai_used": ai_used,
+        "confidence": confidence,
+        "category": category,
+        "insights": insights,
+        "opportunities": opps,
+        "questions": questions,
+        "email_subject": email_subject,
+        "email_body": email_body,
     })
 
     t = sign_doc(doc_id)
 
+    # small preview blocks
+    insights_html = "".join([f"<li>{i}</li>" for i in insights[:5]]) or "<li>—</li>"
+    opps_html = "".join([f"<li><b>{o.get('title','')}</b> — {o.get('why','')} <span class='muted'>({o.get('impact_estimate','')})</span></li>" for o in opps[:4]]) or "<li>—</li>"
+
     inner = f"""
       <h1>Aperçu</h1>
-      <p class="subtitle">Ton rapport est prêt. Débloque la version complète (email + check-list + export PDF).</p>
+      <p class="subtitle">Aperçu gratuit. Le rapport complet débloque le PDF + email copiable + plan d’action complet.</p>
 
       <div class="grid">
         <div>
@@ -681,13 +790,20 @@ async def preview(
           </div>
 
           <div class="kpi">
-            <div class="label">Économie estimée</div>
+            <div class="label">Économie estimée (baseline)</div>
             <div class="value green">{savings:.2f} {currency}</div>
           </div>
 
           <div class="kpi">
-            <div class="label">Fournisseur détecté</div>
-            <div class="value">{vendor}</div>
+            <div class="label">Fournisseur + catégorie</div>
+            <div class="value">{vendor_final}</div>
+            <div class="muted" style="margin-top:6px;">Catégorie: <b>{category}</b></div>
+          </div>
+
+          <div class="kpi">
+            <div class="label">Analyse IA</div>
+            <div class="value" style="font-size:16px;">{"✅ IA active" if ai_used else "⚠️ IA fallback"} — Confiance: {confidence:.2f}</div>
+            <ul style="margin-top:10px;line-height:1.5;">{insights_html}</ul>
           </div>
 
           <a class="btn" href="/pay/{doc_id}?t={t}">Débloquer le rapport complet ({PRICE_CENTS/100:.0f}€)</a>
@@ -698,21 +814,27 @@ async def preview(
 
         <div>
           <div class="kpi">
+            <div class="label">Opportunités détectées (aperçu)</div>
+            <ul style="margin-top:10px;line-height:1.5;">{opps_html}</ul>
+          </div>
+
+          <div class="kpi">
             <div class="label">Ce que tu obtiens</div>
-            <pre>✅ Email prêt à envoyer
-✅ Bouton “Copier”
-✅ Export PDF propre
-✅ Checklist d’optimisation</pre>
+            <pre>✅ Analyse IA complète + score confiance
+✅ Opportunités + questions à poser
+✅ Email ultra adapté
+✅ Export PDF pro
+✅ Bouton “Copier”</pre>
           </div>
         </div>
       </div>
 
-      <p style="margin-top:18px;"><a class="link" href="/pricing">← Retour</a></p>
+      <p style="margin-top:18px;"><a class="link" href="/pricing">← Nouvelle analyse</a></p>
     """
     return shell("Aperçu", inner)
 
 
-# ================= STRIPE ELEMENTS =================
+# ================= STRIPE PAYMENT PAGE =================
 def render_payment_element(doc_id: str, t: str) -> str:
     return f"""
       <div class="white-panel">
@@ -792,7 +914,7 @@ def pay(request: Request, doc_id: str):
         return shell("Erreur", "<h1>Rapport introuvable</h1><p class='muted'>Refais l’aperçu.</p><a class='btn' href='/pricing'>Retour</a>")
 
     if is_paid(doc_id):
-        return JSONResponse({"ok": True, "redirect": f"/full/{doc_id}?t={t}"})
+        return RedirectResponse(f"/full/{doc_id}?t={t}")
 
     vendor = normalize_vendor(data.get("vendor"))
     currency = data.get("currency", "EUR")
@@ -810,7 +932,7 @@ def pay(request: Request, doc_id: str):
             <div class="label">Résumé</div>
             <div class="value">{vendor}</div>
             <div class="muted" style="margin-top:8px;">Montant détecté : <b>{total:.2f} {currency}</b></div>
-            <div class="muted">Économie estimée : <b class="green">{savings:.2f} {currency}</b></div>
+            <div class="muted">Économie baseline : <b class="green">{savings:.2f} {currency}</b></div>
           </div>
 
           <div class="kpi" style="background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.25);">
@@ -820,10 +942,11 @@ def pay(request: Request, doc_id: str):
           </div>
 
           <div class="kpi">
-            <div class="label">Pourquoi ça marche</div>
-            <pre>✅ Tu demandes une remise annuelle
-✅ Tu proposes un downgrade si besoin
-✅ Tu coupes les licences inutilisées</pre>
+            <div class="label">Ce que tu débloques</div>
+            <pre>✅ Audit IA complet (insights + opportunités)
+✅ Questions de négociation prêtes
+✅ Email ultra adapté (copiable)
+✅ Rapport PDF “pro”</pre>
           </div>
 
           <p style="margin-top:18px;"><a class="link" href="/pricing">← Retour</a></p>
@@ -936,21 +1059,26 @@ def full(request: Request, doc_id: str):
     savings = float(data.get("savings") or 0)
     annual = round(savings * 12, 2)
 
-    subject = f"Demande d’amélioration tarifaire - {data['company']}"
-    body = f"""Bonjour,
+    ai_used = bool(data.get("ai_used"))
+    confidence = float(data.get("confidence") or 0.3)
+    category = data.get("category") or "unknown"
+    insights: List[str] = data.get("insights") or []
+    opps: List[Dict[str, str]] = data.get("opportunities") or []
+    questions: List[str] = data.get("questions") or []
 
-Nous utilisons {vendor}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
-Avez-vous une remise annuelle, une offre fidélité, ou un plan plus adapté ?
-
-Cordialement,
-{data['name']}"""
+    subject = data.get("email_subject") or f"Demande d’amélioration tarifaire - {data['company']}"
+    body = data.get("email_body") or ""
 
     email_text = f"Sujet: {subject}\n\n{body}"
     email_text_js = json.dumps(email_text)
 
+    insights_html = "".join([f"<li>{i}</li>" for i in insights]) or "<li>—</li>"
+    opps_html = "".join([f"<li><b>{o.get('title','')}</b> — {o.get('why','')} <span class='muted'>({o.get('impact_estimate','')})</span></li>" for o in opps]) or "<li>—</li>"
+    q_html = "".join([f"<li>{q}</li>" for q in questions]) or "<li>—</li>"
+
     inner = f"""
       <h1>Rapport complet</h1>
-      <p class="subtitle">Email prêt à envoyer + export PDF.</p>
+      <p class="subtitle">Audit IA + stratégie + email prêt à envoyer + export PDF.</p>
 
       <div class="grid">
         <div>
@@ -960,7 +1088,7 @@ Cordialement,
           </div>
 
           <div class="kpi">
-            <div class="label">Économie estimée</div>
+            <div class="label">Économie baseline</div>
             <div class="value green">{savings:.2f} {currency}</div>
           </div>
 
@@ -971,16 +1099,20 @@ Cordialement,
           </div>
 
           <div class="kpi">
-            <div class="label">Fournisseur</div>
-            <div class="value">{vendor}</div>
+            <div class="label">Analyse IA</div>
+            <div class="value" style="font-size:16px;">{"✅ IA active" if ai_used else "⚠️ IA fallback"} — Confiance: {confidence:.2f}</div>
+            <div class="muted" style="margin-top:6px;">Fournisseur: <b>{vendor}</b> • Catégorie: <b>{category}</b></div>
+            <ul style="margin-top:10px;line-height:1.5;">{insights_html}</ul>
           </div>
 
           <div class="kpi">
-            <div class="label">Checklist</div>
-            <pre>✅ Envoyer l’email
-✅ Demander remise annuelle / downgrade
-✅ Vérifier licences inutilisées
-✅ Revue mensuelle des abonnements</pre>
+            <div class="label">Opportunités détectées</div>
+            <ul style="margin-top:10px;line-height:1.5;">{opps_html}</ul>
+          </div>
+
+          <div class="kpi">
+            <div class="label">Questions à poser</div>
+            <ul style="margin-top:10px;line-height:1.5;">{q_html}</ul>
           </div>
 
           <div class="row-actions">
@@ -993,7 +1125,7 @@ Cordialement,
 
         <div>
           <div class="kpi">
-            <div class="label">Email prêt</div>
+            <div class="label">Email prêt (adapté)</div>
             <pre id="emailBlock">Sujet: {subject}
 
 {body}</pre>
@@ -1039,14 +1171,8 @@ def print_view(request: Request, doc_id: str):
     savings = float(data.get("savings") or 0)
     annual = round(savings * 12, 2)
 
-    subject = f"Demande d’amélioration tarifaire - {data['company']}"
-    body = f"""Bonjour,
-
-Nous utilisons {vendor}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
-Avez-vous une remise annuelle, une offre fidélité, ou un plan plus adapté ?
-
-Cordialement,
-{data['name']}"""
+    subject = data.get("email_subject") or f"Demande d’amélioration tarifaire - {data['company']}"
+    body = data.get("email_body") or ""
 
     return f"""
     <html>
@@ -1106,7 +1232,7 @@ Cordialement,
           <div class="value">{total:.2f} {currency}</div>
         </div>
         <div class="kpi">
-          <div class="label">Économie estimée</div>
+          <div class="label">Économie baseline</div>
           <div class="value green">{savings:.2f} {currency}</div>
         </div>
         <div class="kpi greenbox">
@@ -1132,4 +1258,4 @@ Cordialement,
 # ================= HEALTH =================
 @app.get("/health")
 def health():
-    return {"status": "running"}
+    return {"status": "running", "ai_enabled": AI_ENABLED, "ai_model": AI_MODEL}
