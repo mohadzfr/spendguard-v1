@@ -432,93 +432,361 @@ Cordialement,
 # ================= UI SHELL / DESIGN =================
 def shell(title: str, inner: str, wide: bool = False) -> str:
     maxw = "1100px" if wide else "980px"
-    return f"""
-    <html>
-    <head>
-      <meta charset="utf-8"/>
-      <meta name="viewport" content="width=device-width, initial-scale=1"/>
-      <title>{title}</title>
-      <style>
-        :root {{
-          --bg1:#0b1020;
-          --bg2:#111a2f;
-          --card:rgba(255,255,255,0.06);
-          --border:rgba(255,255,255,0.12);
-          --text:#e5e7eb;
-          --muted:#a8b0c2;
-          --brand1:#3b82f6;
-          --brand2:#6366f1;
-          --green:#22c55e;
-          --amber:#fbbf24;
-          --shadow: 0 25px 70px rgba(0,0,0,0.55);
-        }}
-        body {{
-          margin:0;
-          font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-          background: radial-gradient(1200px 600px at 20% 10%, rgba(99,102,241,0.35), transparent 55%),
-                      radial-gradient(900px 500px at 85% 30%, rgba(59,130,246,0.30), transparent 55%),
-                      linear-gradient(135deg, var(--bg1), var(--bg2));
-          color: var(--text);
-          min-height:100vh;
-          display:flex;
-          justify-content:center;
-          align-items:flex-start;
-          padding:44px 14px;
-        }}
-        .container {{ width:100%; max-width:{maxw}; }}
-        .topbar {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }}
-        .brand {{ display:flex; align-items:center; gap:10px; font-weight:900; letter-spacing:-0.6px; font-size:18px; }}
-        .dot {{ width:10px; height:10px; border-radius:999px; background: linear-gradient(90deg, var(--brand1), var(--brand2)); box-shadow: 0 10px 30px rgba(99,102,241,0.45); }}
-        .pill {{ font-size:12px; color:#0b1020; background: rgba(34,197,94,0.95); padding:6px 10px; border-radius: 999px; font-weight:900; }}
-        .card {{ background: var(--card); border:1px solid var(--border); border-radius: 22px; box-shadow: var(--shadow); padding: 26px; }}
-        h1 {{ margin: 0 0 8px 0; font-size: 30px; letter-spacing:-0.8px; }}
-        .subtitle {{ margin:0 0 18px 0; color: var(--muted); font-size:14px; line-height:1.45; }}
-        .grid {{ display:grid; grid-template-columns: 1.1fr 0.9fr; gap:18px; }}
-        @media (max-width: 920px) {{ .grid {{ grid-template-columns: 1fr; }} }}
-        .hero {{ display:grid; grid-template-columns: 1.3fr 0.7fr; gap:18px; align-items:start; }}
-        @media (max-width: 920px) {{ .hero {{ grid-template-columns: 1fr; }} }}
-        .kpi {{ border:1px solid var(--border); background: rgba(255,255,255,0.04); border-radius: 18px; padding: 16px; margin-top: 10px; }}
-        .kpi .label {{ color: var(--muted); font-size: 12px; margin-bottom: 6px; }}
-        .kpi .value {{ font-size: 22px; font-weight: 900; letter-spacing:-0.5px; }}
-        .green {{ color: var(--green); }}
-        .btn {{ display:inline-block; width:100%; padding:14px; border-radius: 14px; border:none; background: linear-gradient(90deg, var(--brand1), var(--brand2)); color:white; font-weight:900; cursor:pointer; text-align:center; text-decoration:none; transition:0.2s; margin-top:10px; }}
-        .btn:hover {{ transform: translateY(-2px); box-shadow: 0 12px 28px rgba(99,102,241,0.35); }}
-        .btn-secondary {{ background: rgba(255,255,255,0.08); border: 1px solid var(--border); }}
-        input, select {{ width:100%; padding:12px 12px; margin:10px 0; border-radius:12px; border:1px solid var(--border); background: rgba(255,255,255,0.07); color: var(--text); outline:none; }}
-        .muted {{ color: var(--muted); font-size: 13px; }}
-        .row-actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }}
-        .row-actions .btn {{ width:auto; flex:1; min-width:220px; }}
-        pre {{ background: rgba(255,255,255,0.08); padding: 16px; border-radius: 14px; white-space: pre-wrap; border: 1px solid var(--border); margin:0; }}
-        .link {{ color: #93c5fd; text-decoration: none; font-weight: 900; }}
-        .badge {{ display:inline-flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--border); border-radius:999px; background: rgba(255,255,255,0.04); color: var(--muted); font-size:12px; font-weight:900; }}
-        .badge b {{ color: var(--text); }}
-        .feature {{ border:1px solid var(--border); background: rgba(255,255,255,0.03); border-radius: 18px; padding: 16px; }}
-        .feature h3 {{ margin:0 0 6px 0; font-size: 15px; }}
-        .feature p {{ margin:0; color: var(--muted); font-size: 13px; line-height:1.4; }}
-        .faq {{ border:1px solid var(--border); border-radius: 18px; padding: 14px 16px; background: rgba(255,255,255,0.03); }}
-        .faq summary {{ cursor:pointer; font-weight: 900; color: var(--text); list-style:none; }}
-        .faq summary::-webkit-details-marker {{ display:none; }}
-        .faq p {{ margin:10px 0 0 0; color: var(--muted); font-size: 13px; line-height:1.5; }}
-        .notice {{ margin-top:12px; padding:12px 14px; border:1px solid rgba(251,191,36,0.35); background: rgba(251,191,36,0.10); border-radius: 16px; color: #fde68a; font-size: 13px; line-height:1.45; }}
-        .white-panel {{ background: #ffffff; color: #0b1020; border-radius: 18px; padding: 18px; }}
-        .white-panel h3 {{ margin: 0 0 10px 0; font-size: 16px; }}
-        ul {{ margin: 8px 0 0 18px; padding: 0; }}
-        li {{ margin: 6px 0; }}
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <div class="topbar">
-          <div class="brand"><span class="dot"></span> SpendGuard</div>
-          <div class="pill">AI SaaS Optimizer</div>
-        </div>
-        <div class="card">
-          {inner}
-        </div>
+
+    css = f"""
+:root {{
+  --bg1:#0b1020;
+  --bg2:#111a2f;
+  --card:rgba(255,255,255,0.07);
+  --border:rgba(255,255,255,0.14);
+  --text:#e5e7eb;
+  --muted:#a8b0c2;
+  --brand1:#3b82f6;
+  --brand2:#6366f1;
+  --green:#22c55e;
+  --amber:#fbbf24;
+  --shadow: 0 25px 70px rgba(0,0,0,0.55);
+}}
+
+/* ===== GLOBAL ===== */
+* {{ box-sizing: border-box; }}
+
+html, body {{
+  height: 100%;
+}}
+
+body {{
+  margin:0;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  color: var(--text);
+  min-height:100vh;
+  display:flex;
+  justify-content:center;
+  align-items:flex-start;
+  padding:44px 14px;
+  background:#0b1020;
+  overflow-x:hidden;
+}}
+
+/* Fond premium fixe (anti-répétition au scroll) */
+body::before {{
+  content:"";
+  position:fixed;
+  inset:0;
+  z-index:-1;
+
+  background:
+    radial-gradient(1200px 600px at 20% 10%, rgba(99,102,241,0.35), transparent 55%),
+    radial-gradient(900px 500px at 85% 30%, rgba(59,130,246,0.30), transparent 55%),
+    linear-gradient(135deg, var(--bg1), var(--bg2));
+
+  background-repeat:no-repeat;
+  background-size:cover;
+  transform:translateZ(0);
+  will-change: transform;
+}}
+
+/* ===== LAYOUT ===== */
+.container {{
+  width:100%;
+  max-width:{maxw};
+}}
+
+.topbar {{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:18px;
+}}
+
+.brand {{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  font-weight:900;
+  letter-spacing:-0.6px;
+  font-size:18px;
+}}
+
+.dot {{
+  width:10px;
+  height:10px;
+  border-radius:999px;
+  background: linear-gradient(90deg, var(--brand1), var(--brand2));
+  box-shadow: 0 10px 30px rgba(99,102,241,0.45);
+}}
+
+.pill {{
+  font-size:12px;
+  color:#0b1020;
+  background: rgba(34,197,94,0.95);
+  padding:6px 10px;
+  border-radius:999px;
+  font-weight:900;
+}}
+
+/* ===== CARD ===== */
+.card {{
+  background: var(--card);
+  border:1px solid var(--border);
+  border-radius:22px;
+  box-shadow: var(--shadow);
+  padding:26px;
+  backdrop-filter: blur(10px);
+}}
+
+/* ===== TYPO ===== */
+h1 {{
+  margin:0 0 8px 0;
+  font-size:30px;
+  letter-spacing:-0.8px;
+}}
+
+.subtitle {{
+  margin:0 0 18px 0;
+  color: var(--muted);
+  font-size:14px;
+  line-height:1.45;
+}}
+
+/* ===== GRID ===== */
+.grid {{
+  display:grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap:18px;
+}}
+
+@media (max-width: 920px) {{
+  .grid {{ grid-template-columns:1fr; }}
+}}
+
+.hero {{
+  display:grid;
+  grid-template-columns: 1.3fr 0.7fr;
+  gap:18px;
+  align-items:start;
+}}
+
+@media (max-width: 920px) {{
+  .hero {{ grid-template-columns:1fr; }}
+}}
+
+/* ===== KPI ===== */
+.kpi {{
+  border:1px solid var(--border);
+  background: rgba(255,255,255,0.05);
+  border-radius:18px;
+  padding:16px;
+  margin-top:10px;
+}}
+
+.kpi .label {{
+  color: var(--muted);
+  font-size:12px;
+  margin-bottom:6px;
+}}
+
+.kpi .value {{
+  font-size:22px;
+  font-weight:900;
+  letter-spacing:-0.5px;
+}}
+
+.green {{ color: var(--green); }}
+
+/* ===== BUTTONS ===== */
+.btn {{
+  display:inline-block;
+  width:100%;
+  padding:14px;
+  border-radius:14px;
+  border:none;
+  background: linear-gradient(90deg, var(--brand1), var(--brand2));
+  color:white;
+  font-weight:900;
+  cursor:pointer;
+  text-align:center;
+  text-decoration:none;
+  transition:all 0.2s ease;
+  margin-top:10px;
+}}
+
+.btn:hover {{
+  transform: translateY(-2px);
+  box-shadow: 0 12px 28px rgba(99,102,241,0.35);
+}}
+
+.btn-secondary {{
+  background: rgba(255,255,255,0.08);
+  border:1px solid var(--border);
+}}
+
+/* ===== INPUTS ===== */
+input, select {{
+  width:100%;
+  padding:12px;
+  margin:10px 0;
+  border-radius:12px;
+  border:1px solid var(--border);
+  background: rgba(255,255,255,0.07);
+  color: var(--text);
+  outline:none;
+  transition:0.2s;
+}}
+
+input:focus, select:focus {{
+  border-color: var(--brand1);
+  box-shadow:0 0 0 2px rgba(59,130,246,0.3);
+}}
+
+/* ===== UTILS ===== */
+.muted {{
+  color: var(--muted);
+  font-size:13px;
+}}
+
+.row-actions {{
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-top:12px;
+}}
+
+.row-actions .btn {{
+  width:auto;
+  flex:1;
+  min-width:220px;
+}}
+
+pre {{
+  background: rgba(255,255,255,0.08);
+  padding:16px;
+  border-radius:14px;
+  white-space: pre-wrap;
+  border:1px solid var(--border);
+  margin:0;
+}}
+
+.link {{
+  color:#93c5fd;
+  text-decoration:none;
+  font-weight:900;
+}}
+
+.badge {{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  padding:8px 10px;
+  border:1px solid var(--border);
+  border-radius:999px;
+  background: rgba(255,255,255,0.05);
+  color: var(--muted);
+  font-size:12px;
+  font-weight:900;
+}}
+
+.badge b {{ color: var(--text); }}
+
+.feature {{
+  border:1px solid var(--border);
+  background: rgba(255,255,255,0.04);
+  border-radius:18px;
+  padding:16px;
+}}
+
+.feature h3 {{
+  margin:0 0 6px 0;
+  font-size:15px;
+}}
+
+.feature p {{
+  margin:0;
+  color: var(--muted);
+  font-size:13px;
+  line-height:1.4;
+}}
+
+.faq {{
+  border:1px solid var(--border);
+  border-radius:18px;
+  padding:14px 16px;
+  background: rgba(255,255,255,0.04);
+}}
+
+.faq summary {{
+  cursor:pointer;
+  font-weight:900;
+  color: var(--text);
+  list-style:none;
+}}
+
+.faq summary::-webkit-details-marker {{
+  display:none;
+}}
+
+.faq p {{
+  margin:10px 0 0 0;
+  color: var(--muted);
+  font-size:13px;
+  line-height:1.5;
+}}
+
+.notice {{
+  margin-top:12px;
+  padding:12px 14px;
+  border:1px solid rgba(251,191,36,0.35);
+  background: rgba(251,191,36,0.10);
+  border-radius:16px;
+  color:#fde68a;
+  font-size:13px;
+  line-height:1.45;
+}}
+
+.white-panel {{
+  background:#ffffff;
+  color:#0b1020;
+  border-radius:18px;
+  padding:18px;
+}}
+
+.white-panel h3 {{
+  margin:0 0 10px 0;
+  font-size:16px;
+}}
+
+ul {{
+  margin:8px 0 0 18px;
+  padding:0;
+}}
+
+li {{ margin:6px 0; }}
+""".strip()
+
+    html = f"""<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>{title}</title>
+    <style>
+{css}
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="topbar">
+        <div class="brand"><span class="dot"></span> SpendGuard</div>
+        <div class="pill">AI SaaS Optimizer</div>
       </div>
-    </body>
-    </html>
-    """
+      <div class="card">
+        {inner}
+      </div>
+    </div>
+  </body>
+</html>
+"""
+    return html
 
 
 # ================= ROUTES CONVERSION =================
