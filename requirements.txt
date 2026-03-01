@@ -1,6 +1,7 @@
 fastapi
 uvicorn
+python-multipart
 pdfplumber
 stripe
-python-multipart
 python-dotenv
+pydantic
