@@ -12,17 +12,18 @@ import stripe
 import time
 import hmac
 import hashlib
+from fastapi.responses import RedirectResponse
 
 
 # ================= CONFIG =================
-load_dotenv()  # lit .env en local (ne JAMAIS push)
+load_dotenv()
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 APP_SECRET = os.getenv("APP_SECRET", "change-me-please")
 
-PRICE_CENTS = int(os.getenv("PRICE_CENTS", "900"))  # 9€ par défaut
+PRICE_CENTS = int(os.getenv("PRICE_CENTS", "900"))
 CURRENCY = os.getenv("CURRENCY", "eur")
 
 if not STRIPE_SECRET_KEY or not STRIPE_PUBLISHABLE_KEY or not STRIPE_WEBHOOK_SECRET:
@@ -30,7 +31,7 @@ if not STRIPE_SECRET_KEY or not STRIPE_PUBLISHABLE_KEY or not STRIPE_WEBHOOK_SEC
 
 stripe.api_key = STRIPE_SECRET_KEY
 
-app = FastAPI(title="SpendGuard AI", version="1.0.0")
+app = FastAPI(title="SpendGuard AI", version="1.1.0")
 
 DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -49,9 +50,9 @@ def check_sig(doc_id: str, t: Optional[str]) -> bool:
     return hmac.compare_digest(sign_doc(doc_id), t)
 
 
-# ================= PERSISTENCE (STATE.JSON) =================
+# ================= STATE.JSON =================
 def _default_state() -> Dict[str, Any]:
-    return {"reports": {}, "paid": {}}  # paid: {doc_id: {"ts": int, "payment_intent": str}}
+    return {"reports": {}, "paid": {}}
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_PATH):
@@ -61,7 +62,6 @@ def load_state() -> Dict[str, Any]:
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # migration douce
         if "paid" in data and isinstance(data["paid"], list):
             data["paid"] = {doc_id: {"ts": int(time.time()), "payment_intent": ""} for doc_id in data["paid"]}
         if "paid" not in data or not isinstance(data["paid"], dict):
@@ -103,6 +103,30 @@ def is_paid_local(doc_id: str, ttl_days: int = 7) -> bool:
     if ts <= 0:
         return True
     return ts >= int(time.time()) - ttl_days * 24 * 3600
+
+def is_paid(doc_id: str) -> bool:
+    if is_paid_local(doc_id):
+        return True
+    try:
+        seven_days_ago = int(time.time()) - 7 * 24 * 3600
+        starting_after = None
+        while True:
+            params = {"limit": 100, "created": {"gte": seven_days_ago}}
+            if starting_after:
+                params["starting_after"] = starting_after
+            intents = stripe.PaymentIntent.list(**params)
+            for pi in intents.data:
+                md = pi.metadata or {}
+                if md.get("doc_id") == doc_id and pi.status == "succeeded":
+                    mark_paid(doc_id, payment_intent=pi.id)
+                    return True
+            if intents.has_more and intents.data:
+                starting_after = intents.data[-1].id
+            else:
+                break
+        return False
+    except Exception:
+        return False
 
 
 # ================= EXTRACTION FACTURE =================
@@ -227,39 +251,9 @@ def extract_total_amount(raw_text: str) -> float:
     return 0.0
 
 
-# ================= STRIPE: PAID CHECK (fallback) =================
-def is_paid(doc_id: str) -> bool:
-    # 1) local state d’abord (rapide)
-    if is_paid_local(doc_id):
-        return True
-
-    # 2) fallback Stripe (utile si state reset / webhook en retard)
-    try:
-        seven_days_ago = int(time.time()) - 7 * 24 * 3600
-        starting_after = None
-        while True:
-            params = {"limit": 100, "created": {"gte": seven_days_ago}}
-            if starting_after:
-                params["starting_after"] = starting_after
-
-            intents = stripe.PaymentIntent.list(**params)
-            for pi in intents.data:
-                md = pi.metadata or {}
-                if md.get("doc_id") == doc_id and pi.status == "succeeded":
-                    mark_paid(doc_id, payment_intent=pi.id)
-                    return True
-
-            if intents.has_more and intents.data:
-                starting_after = intents.data[-1].id
-            else:
-                break
-        return False
-    except Exception:
-        return False
-
-
-# ================= UI SHELL =================
-def shell(title: str, inner: str) -> str:
+# ================= UI SHELL (UX BOOST) =================
+def shell(title: str, inner: str, wide: bool = False) -> str:
+    maxw = "1100px" if wide else "980px"
     return f"""
     <html>
     <head>
@@ -277,8 +271,10 @@ def shell(title: str, inner: str) -> str:
           --brand1:#3b82f6;
           --brand2:#6366f1;
           --green:#22c55e;
+          --amber:#fbbf24;
           --shadow: 0 25px 70px rgba(0,0,0,0.55);
         }}
+
         body {{
           margin:0;
           font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
@@ -290,46 +286,61 @@ def shell(title: str, inner: str) -> str:
           display:flex;
           justify-content:center;
           align-items:flex-start;
-          padding:48px 16px;
+          padding:44px 14px;
         }}
-        .container {{ width:100%; max-width: 980px; }}
-        .topbar {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }}
-        .logo {{ font-weight:900; letter-spacing:-0.6px; font-size:18px; }}
+
+        .container {{ width:100%; max-width:{maxw}; }}
+        .topbar {{
+          display:flex; align-items:center; justify-content:space-between;
+          margin-bottom:18px;
+        }}
+        .brand {{
+          display:flex; align-items:center; gap:10px;
+          font-weight:900; letter-spacing:-0.6px; font-size:18px;
+        }}
+        .dot {{
+          width:10px; height:10px; border-radius:999px;
+          background: linear-gradient(90deg, var(--brand1), var(--brand2));
+          box-shadow: 0 10px 30px rgba(99,102,241,0.45);
+        }}
         .pill {{
           font-size:12px; color:#0b1020; background: rgba(34,197,94,0.95);
-          padding:6px 10px; border-radius: 999px; font-weight:800;
+          padding:6px 10px; border-radius: 999px; font-weight:900;
         }}
+
         .card {{
           background: var(--card);
           border:1px solid var(--border);
           border-radius: 22px;
           box-shadow: var(--shadow);
-          padding: 28px;
+          padding: 26px;
         }}
+
+        h1 {{ margin: 0 0 8px 0; font-size: 30px; letter-spacing:-0.8px; }}
+        .subtitle {{ margin:0 0 18px 0; color: var(--muted); font-size:14px; line-height:1.45; }}
+
         .grid {{ display:grid; grid-template-columns: 1.1fr 0.9fr; gap:18px; }}
-        @media (max-width: 900px) {{ .grid {{ grid-template-columns: 1fr; }} }}
-        h1 {{ margin: 0 0 8px 0; font-size: 28px; letter-spacing:-0.7px; }}
-        .subtitle {{ margin:0 0 18px 0; color: var(--muted); font-size:14px; line-height:1.4; }}
-        .stepper {{ display:flex; gap:10px; margin: 14px 0 18px 0; flex-wrap:wrap; }}
-        .step {{
+        @media (max-width: 920px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+
+        .hero {{
+          display:grid;
+          grid-template-columns: 1.3fr 0.7fr;
+          gap:18px;
+          align-items:start;
+        }}
+        @media (max-width: 920px) {{ .hero {{ grid-template-columns: 1fr; }} }}
+
+        .kpi {{
           border:1px solid var(--border);
           background: rgba(255,255,255,0.04);
-          padding:10px 12px;
-          border-radius: 14px;
-          font-size: 13px;
-          color: var(--muted);
+          border-radius: 18px;
+          padding: 16px;
+          margin-top: 10px;
         }}
-        .step strong {{ color: var(--text); }}
-        input, select {{
-          width:100%;
-          padding:12px 12px;
-          margin:10px 0;
-          border-radius:12px;
-          border:1px solid var(--border);
-          background: rgba(255,255,255,0.07);
-          color: var(--text);
-          outline:none;
-        }}
+        .kpi .label {{ color: var(--muted); font-size: 12px; margin-bottom: 6px; }}
+        .kpi .value {{ font-size: 22px; font-weight: 900; letter-spacing:-0.5px; }}
+        .green {{ color: var(--green); }}
+
         .btn {{
           display:inline-block;
           width:100%;
@@ -350,17 +361,26 @@ def shell(title: str, inner: str) -> str:
           background: rgba(255,255,255,0.08);
           border: 1px solid var(--border);
         }}
-        .muted {{ color: var(--muted); font-size: 13px; }}
-        .kpi {{
+
+        input, select {{
+          width:100%;
+          padding:12px 12px;
+          margin:10px 0;
+          border-radius:12px;
           border:1px solid var(--border);
-          background: rgba(255,255,255,0.04);
-          border-radius: 18px;
-          padding: 16px;
-          margin-top: 10px;
+          background: rgba(255,255,255,0.07);
+          color: var(--text);
+          outline:none;
         }}
-        .kpi .label {{ color: var(--muted); font-size: 12px; margin-bottom: 6px; }}
-        .kpi .value {{ font-size: 22px; font-weight: 900; letter-spacing:-0.5px; }}
-        .green {{ color: var(--green); }}
+
+        .muted {{ color: var(--muted); font-size: 13px; }}
+        .row-actions {{
+          display:flex; gap:10px; flex-wrap:wrap; margin-top:12px;
+        }}
+        .row-actions .btn {{
+          width:auto; flex:1; min-width:220px;
+        }}
+
         pre {{
           background: rgba(255,255,255,0.08);
           padding: 16px;
@@ -369,30 +389,69 @@ def shell(title: str, inner: str) -> str:
           border: 1px solid var(--border);
           margin:0;
         }}
-        .link {{ color: #93c5fd; text-decoration: none; font-weight: 800; }}
-        .row-actions {{
-          display:flex;
-          gap:10px;
-          flex-wrap:wrap;
+
+        .link {{ color: #93c5fd; text-decoration: none; font-weight: 900; }}
+
+        .badge {{
+          display:inline-flex; align-items:center; gap:8px;
+          padding:8px 10px;
+          border:1px solid var(--border);
+          border-radius:999px;
+          background: rgba(255,255,255,0.04);
+          color: var(--muted);
+          font-size:12px;
+          font-weight:900;
+        }}
+        .badge b {{ color: var(--text); }}
+
+        .feature {{
+          border:1px solid var(--border);
+          background: rgba(255,255,255,0.03);
+          border-radius: 18px;
+          padding: 16px;
+        }}
+        .feature h3 {{ margin:0 0 6px 0; font-size: 15px; }}
+        .feature p {{ margin:0; color: var(--muted); font-size: 13px; line-height:1.4; }}
+
+        .faq {{
+          border:1px solid var(--border);
+          border-radius: 18px;
+          padding: 14px 16px;
+          background: rgba(255,255,255,0.03);
+        }}
+        .faq summary {{
+          cursor:pointer;
+          font-weight: 900;
+          color: var(--text);
+          list-style:none;
+        }}
+        .faq summary::-webkit-details-marker {{ display:none; }}
+        .faq p {{ margin:10px 0 0 0; color: var(--muted); font-size: 13px; line-height:1.5; }}
+
+        .notice {{
           margin-top:12px;
+          padding:12px 14px;
+          border:1px solid rgba(251,191,36,0.35);
+          background: rgba(251,191,36,0.10);
+          border-radius: 16px;
+          color: #fde68a;
+          font-size: 13px;
+          line-height:1.45;
         }}
-        .row-actions .btn {{
-          width:auto;
-          flex: 1;
-          min-width: 220px;
-        }}
+
         .white-panel {{
           background: #ffffff;
           color: #0b1020;
           border-radius: 18px;
           padding: 18px;
         }}
+        .white-panel h3 {{ margin: 0 0 10px 0; font-size: 16px; }}
       </style>
     </head>
     <body>
       <div class="container">
         <div class="topbar">
-          <div class="logo">SpendGuard</div>
+          <div class="brand"><span class="dot"></span> SpendGuard</div>
           <div class="pill">AI SaaS Optimizer</div>
         </div>
         <div class="card">
@@ -404,34 +463,168 @@ def shell(title: str, inner: str) -> str:
     """
 
 
-# ================= LANDING =================
+# ================= OPTION B: LANDING CONVERSION =================
+
 @app.get("/", response_class=HTMLResponse)
-def home():
+def root():
+    return RedirectResponse("/pricing")
+
+@app.get("/pricing", response_class=HTMLResponse)
+def pricing():
+    price = f"{PRICE_CENTS/100:.0f}€"
     inner = f"""
-      <h1>Optimise tes abonnements SaaS</h1>
-      <p class="subtitle">Upload une facture PDF. On détecte le montant, le fournisseur, et on génère un email de négociation prêt à envoyer.</p>
+      <div class="hero">
+        <div>
+          <h1>Stop payer trop cher tes SaaS.</h1>
+          <p class="subtitle">
+            Upload une facture PDF → on détecte le fournisseur & le montant → on génère un <b>email de négociation</b>
+            + checklist + export PDF. Résultat en 30 secondes.
+          </p>
 
-      <div class="stepper">
-        <div class="step"><strong>1.</strong> Aperçu</div>
-        <div class="step"><strong>2.</strong> Paiement</div>
-        <div class="step"><strong>3.</strong> Rapport complet</div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;">
+            <span class="badge">⚡ <b>30 sec</b> par audit</span>
+            <span class="badge">📉 <b>10–15%</b> d’économies typiques</span>
+            <span class="badge">🔒 <b>Paiement</b> Stripe</span>
+          </div>
+
+          <div class="notice">
+            <b>Astuce conversion :</b> commence par voir un exemple, puis teste avec ta facture.
+          </div>
+
+          <div class="row-actions" style="margin-top:16px;">
+            <a class="btn" href="#try">Essayer maintenant</a>
+            <a class="btn btn-secondary" href="/example">Voir un exemple</a>
+          </div>
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px;">
+            <div class="feature">
+              <h3>✅ Email prêt à envoyer</h3>
+              <p>Texte clair, pro, orienté “remise annuelle / downgrade / licences inutilisées”.</p>
+            </div>
+            <div class="feature">
+              <h3>✅ Export PDF “rapport”</h3>
+              <p>Format clean pour ton dossier achats ou ton boss.</p>
+            </div>
+            <div class="feature">
+              <h3>✅ Checklist actionnable</h3>
+              <p>Le plan simple pour récupérer de l’argent rapidement.</p>
+            </div>
+            <div class="feature">
+              <h3>✅ Confidentialité</h3>
+              <p>On traite juste ton PDF pour extraire montant/fournisseur (MVP).</p>
+            </div>
+          </div>
+
+          <h2 style="margin-top:22px;font-size:18px;margin-bottom:10px;">FAQ</h2>
+
+          <div style="display:grid;gap:10px;">
+            <details class="faq">
+              <summary>Ça marche avec toutes les factures ?</summary>
+              <p>Ça marche déjà bien sur les PDF “classiques”. Si ton PDF est une image scannée, l’extraction peut être moins fiable (on pourra ajouter OCR ensuite).</p>
+            </details>
+            <details class="faq">
+              <summary>Pourquoi je paie {price} ?</summary>
+              <p>L’aperçu est gratuit. Le paiement débloque le rapport complet (email + checklist + PDF). Stripe sécurise le paiement.</p>
+            </details>
+            <details class="faq">
+              <summary>Et si le fournisseur est mal détecté ?</summary>
+              <p>Pas grave : le rapport reste utile. On ajoute ensuite une correction manuelle et une meilleure détection.</p>
+            </details>
+          </div>
+        </div>
+
+        <div class="kpi" id="try" style="margin-top:0;">
+          <div class="label">Faire un audit</div>
+          <div class="value" style="font-size:18px;">Upload une facture PDF</div>
+
+          <form action="/preview" method="post" enctype="multipart/form-data" style="margin-top:10px;">
+            <input type="file" name="file" required />
+            <input type="text" name="company_name" placeholder="Nom de l’entreprise" required />
+            <input type="text" name="signature_name" placeholder="Votre nom" required />
+            <select name="tone">
+              <option value="Pro">Professionnel</option>
+              <option value="Amical">Amical</option>
+              <option value="Direct">Direct</option>
+            </select>
+            <button class="btn" type="submit">Générer l’aperçu</button>
+          </form>
+
+          <p class="muted" style="margin-top:12px;">Rapport complet : <b>{price}</b>.</p>
+          <p class="muted" style="margin-top:6px;">Tu peux aussi <a class="link" href="/example">voir un exemple</a> avant.</p>
+        </div>
       </div>
-
-      <form action="/preview" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" required />
-        <input type="text" name="company_name" placeholder="Nom de l’entreprise" required />
-        <input type="text" name="signature_name" placeholder="Votre nom" required />
-        <select name="tone">
-          <option value="Pro">Professionnel</option>
-          <option value="Amical">Amical</option>
-          <option value="Direct">Direct</option>
-        </select>
-        <button class="btn" type="submit">Générer l’aperçu</button>
-      </form>
-
-      <p class="muted" style="margin-top:12px;">Rapport complet : <strong>{PRICE_CENTS/100:.0f}€</strong> (paiement sécurisé Stripe).</p>
     """
-    return shell("SpendGuard", inner)
+    return shell("SpendGuard — Pricing", inner, wide=True)
+
+
+# ================= EXEMPLE RAPPORT (CONVERSION) =================
+@app.get("/example", response_class=HTMLResponse)
+def example():
+    # Exemple statique — rassure et augmente conversion
+    vendor = "Microsoft 365"
+    company = "Exemple SARL"
+    name = "Mohamed"
+    currency = "EUR"
+    total = 540.00
+    savings = 81.00
+    annual = round(savings * 12, 2)
+
+    subject = f"Demande d’amélioration tarifaire - {company}"
+    body = f"""Bonjour,
+
+Nous utilisons {vendor}. Avant renouvellement, nous souhaitons discuter d’un ajustement tarifaire.
+Avez-vous une remise annuelle, une offre fidélité, ou un plan plus adapté ?
+
+Cordialement,
+{name}"""
+
+    inner = f"""
+      <h1>Exemple de rapport</h1>
+      <p class="subtitle">Voici exactement ce que tu obtiens après paiement : KPI + email prêt + PDF.</p>
+
+      <div class="grid">
+        <div>
+          <div class="kpi">
+            <div class="label">Montant</div>
+            <div class="value">{total:.2f} {currency}</div>
+          </div>
+
+          <div class="kpi">
+            <div class="label">Économie estimée</div>
+            <div class="value green">{savings:.2f} {currency}</div>
+          </div>
+
+          <div class="kpi" style="background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.25);">
+            <div class="label">Projection annuelle</div>
+            <div class="value green">{annual:.2f} {currency}</div>
+            <div class="muted" style="margin-top:6px;">(si cette dépense est mensuelle)</div>
+          </div>
+
+          <div class="kpi">
+            <div class="label">Checklist</div>
+            <pre>✅ Envoyer l’email
+✅ Demander remise annuelle / downgrade
+✅ Vérifier licences inutilisées
+✅ Revue mensuelle des abonnements</pre>
+          </div>
+
+          <div class="row-actions">
+            <a class="btn" href="/pricing#try">Tester avec ma facture</a>
+            <a class="btn btn-secondary" href="/pricing">Retour</a>
+          </div>
+        </div>
+
+        <div>
+          <div class="kpi">
+            <div class="label">Email prêt</div>
+            <pre>Sujet: {subject}
+
+{body}</pre>
+          </div>
+        </div>
+      </div>
+    """
+    return shell("SpendGuard — Exemple", inner)
 
 
 # ================= PREVIEW =================
@@ -459,7 +652,6 @@ async def preview(
     currency = detect_currency(raw_text)
     total = extract_total_amount(raw_text)
 
-    # Estimation “business”
     rate = 0.10 if total < 1000 else 0.15
     savings = round(min(total * rate, 2500), 2) if total > 0 else 0.0
 
@@ -499,6 +691,8 @@ async def preview(
           </div>
 
           <a class="btn" href="/pay/{doc_id}?t={t}">Débloquer le rapport complet ({PRICE_CENTS/100:.0f}€)</a>
+          <a class="btn btn-secondary" href="/example">Voir un exemple</a>
+
           <p class="muted" style="margin-top:10px;">ID : <strong>{doc_id}</strong></p>
         </div>
 
@@ -513,14 +707,13 @@ async def preview(
         </div>
       </div>
 
-      <p style="margin-top:18px;"><a class="link" href="/">← Nouvelle analyse</a></p>
+      <p style="margin-top:18px;"><a class="link" href="/pricing">← Retour</a></p>
     """
     return shell("Aperçu", inner)
 
 
-# ================= PAIEMENT PAGE =================
+# ================= STRIPE ELEMENTS =================
 def render_payment_element(doc_id: str, t: str) -> str:
-    # Payment Element: create-payment-intent -> confirmPayment -> return_url /success/{doc_id}?t=...
     return f"""
       <div class="white-panel">
         <h3>Paiement sécurisé</h3>
@@ -541,7 +734,6 @@ def render_payment_element(doc_id: str, t: str) -> str:
         (async () => {{
           const msg = document.getElementById("payMsg");
           const btn = document.getElementById("submit");
-
           const stripe = Stripe("{STRIPE_PUBLISHABLE_KEY}");
 
           const res = await fetch("/create-payment-intent", {{
@@ -593,13 +785,12 @@ def render_payment_element(doc_id: str, t: str) -> str:
 def pay(request: Request, doc_id: str):
     t = request.query_params.get("t")
     if not check_sig(doc_id, t):
-        return shell("Lien invalide", "<h1>Lien invalide</h1><p class='muted'>Reviens depuis l’aperçu.</p><a class='btn' href='/'>Retour</a>")
+        return shell("Lien invalide", "<h1>Lien invalide</h1><p class='muted'>Reviens depuis l’aperçu.</p><a class='btn' href='/pricing'>Retour</a>")
 
     data = get_report(doc_id)
     if not data:
-        return shell("Erreur", "<h1>Rapport introuvable</h1><p class='muted'>Refais l’aperçu.</p><a class='btn' href='/'>Retour</a>")
+        return shell("Erreur", "<h1>Rapport introuvable</h1><p class='muted'>Refais l’aperçu.</p><a class='btn' href='/pricing'>Retour</a>")
 
-    # déjà payé ?
     if is_paid(doc_id):
         return JSONResponse({"ok": True, "redirect": f"/full/{doc_id}?t={t}"})
 
@@ -612,12 +803,6 @@ def pay(request: Request, doc_id: str):
     inner = f"""
       <h1>Paiement</h1>
       <p class="subtitle">Débloque le rapport complet. Montant : <strong>{PRICE_CENTS/100:.0f}€</strong>.</p>
-
-      <div class="stepper">
-        <div class="step"><strong>1.</strong> Aperçu ✅</div>
-        <div class="step"><strong>2.</strong> Paiement</div>
-        <div class="step"><strong>3.</strong> Rapport complet</div>
-      </div>
 
       <div class="grid">
         <div>
@@ -635,13 +820,13 @@ def pay(request: Request, doc_id: str):
           </div>
 
           <div class="kpi">
-            <div class="label">Conseil</div>
-            <pre>🎯 Objectif : obtenir une remise
-📌 Demande : annualisation + downgrade + licences inutilisées
-⏱ Temps : 2 minutes</pre>
+            <div class="label">Pourquoi ça marche</div>
+            <pre>✅ Tu demandes une remise annuelle
+✅ Tu proposes un downgrade si besoin
+✅ Tu coupes les licences inutilisées</pre>
           </div>
 
-          <p style="margin-top:18px;"><a class="link" href="/">← Retour</a></p>
+          <p style="margin-top:18px;"><a class="link" href="/pricing">← Retour</a></p>
         </div>
 
         <div>
@@ -652,7 +837,6 @@ def pay(request: Request, doc_id: str):
     return shell("Paiement", inner)
 
 
-# ================= CREATE PAYMENT INTENT =================
 class PayReq(BaseModel):
     doc_id: str
     t: str
@@ -661,7 +845,6 @@ class PayReq(BaseModel):
 def create_payment_intent(req: PayReq):
     if not check_sig(req.doc_id, req.t):
         raise HTTPException(status_code=403, detail="token invalide")
-
     if not get_report(req.doc_id):
         raise HTTPException(status_code=404, detail="doc_id introuvable")
 
@@ -674,14 +857,12 @@ def create_payment_intent(req: PayReq):
     return JSONResponse({"client_secret": intent.client_secret})
 
 
-# ================= SUCCESS (RETURN_URL) =================
 @app.get("/success/{doc_id}", response_class=HTMLResponse)
 def success(request: Request, doc_id: str):
     t = request.query_params.get("t")
     if not check_sig(doc_id, t):
-        return shell("Lien invalide", "<h1>Lien invalide</h1><p class='muted'>Token manquant.</p><a class='btn' href='/'>Retour</a>")
+        return shell("Lien invalide", "<h1>Lien invalide</h1><p class='muted'>Token manquant.</p><a class='btn' href='/pricing'>Retour</a>")
 
-    # Stripe redirige avec payment_intent dans l’URL (souvent), on peut l’utiliser pour marquer paid immédiatement
     pi_id = request.query_params.get("payment_intent")
     if pi_id:
         try:
@@ -691,13 +872,11 @@ def success(request: Request, doc_id: str):
         except Exception:
             pass
 
-    # si webhook a déjà mark_paid, ou fallback Stripe:
     if not is_paid(doc_id):
         inner = f"""
           <h1>Paiement en cours de confirmation</h1>
-          <p class="subtitle">Si tu viens de payer, attends 2–5 secondes puis clique sur le bouton.</p>
+          <p class="subtitle">Attends 2–5 secondes puis clique sur le bouton.</p>
           <a class="btn" href="/full/{doc_id}?t={t}">Accéder au rapport</a>
-          <p class="muted" style="margin-top:10px;">Si ça bloque, reviens sur la page paiement.</p>
           <a class="btn btn-secondary" href="/pay/{doc_id}?t={t}">Retour paiement</a>
         """
         return shell("Confirmation", inner)
@@ -710,7 +889,6 @@ def success(request: Request, doc_id: str):
     return shell("Succès", inner)
 
 
-# ================= WEBHOOK STRIPE =================
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
     payload = await request.body()
@@ -729,10 +907,8 @@ async def stripe_webhook(request: Request):
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    event_type = event.get("type", "")
-    obj = event["data"]["object"]
-
-    if event_type == "payment_intent.succeeded":
+    if event.get("type") == "payment_intent.succeeded":
+        obj = event["data"]["object"]
         doc_id = (obj.get("metadata") or {}).get("doc_id")
         if doc_id:
             mark_paid(doc_id, payment_intent=obj.get("id", ""))
@@ -740,22 +916,19 @@ async def stripe_webhook(request: Request):
     return {"received": True}
 
 
-# ================= RAPPORT COMPLET =================
+# ================= FULL REPORT =================
 @app.get("/full/{doc_id}", response_class=HTMLResponse)
 def full(request: Request, doc_id: str):
     t = request.query_params.get("t")
     if not check_sig(doc_id, t):
-        return shell("Lien invalide", "<h1>Lien invalide</h1><p class='muted'>Reviens via le lien après paiement.</p><a class='btn' href='/'>Retour</a>")
+        return shell("Lien invalide", "<h1>Lien invalide</h1><p class='muted'>Reviens via le lien après paiement.</p><a class='btn' href='/pricing'>Retour</a>")
 
     data = get_report(doc_id)
     if not data:
-        return shell("Erreur", "<h1>Rapport introuvable</h1><p class='muted'>Refais l’aperçu.</p><a class='btn' href='/'>Retour</a>")
+        return shell("Erreur", "<h1>Rapport introuvable</h1><p class='muted'>Refais l’aperçu.</p><a class='btn' href='/pricing'>Retour</a>")
 
     if not is_paid(doc_id):
-        return shell(
-            "Accès verrouillé",
-            f"<h1>Accès verrouillé</h1><p class='muted'>Paiement requis.</p><a class='btn' href='/pay/{doc_id}?t={t}'>Payer</a>",
-        )
+        return shell("Accès verrouillé", f"<h1>Accès verrouillé</h1><p class='muted'>Paiement requis.</p><a class='btn' href='/pay/{doc_id}?t={t}'>Payer</a>")
 
     vendor = normalize_vendor(data.get("vendor"))
     currency = data.get("currency", "EUR")
@@ -777,7 +950,6 @@ Cordialement,
 
     inner = f"""
       <h1>Rapport complet</h1>
-      <p style="opacity:0.7;font-size:14px;">Analyse IA basée sur optimisation SaaS B2B (benchmark 2026)</p>
       <p class="subtitle">Email prêt à envoyer + export PDF.</p>
 
       <div class="grid">
@@ -838,17 +1010,17 @@ Cordialement,
             await navigator.clipboard.writeText(emailText);
             msg.textContent = "✅ Email copié dans le presse-papier.";
           }} catch (e) {{
-            msg.textContent = "⚠️ Copie automatique refusée. Sélectionne le texte et copie manuellement.";
+            msg.textContent = "⚠️ Copie automatique refusée. Copie manuellement.";
           }}
         }});
       </script>
 
-      <p style="margin-top:18px;"><a class="link" href="/">← Nouvelle analyse</a></p>
+      <p style="margin-top:18px;"><a class="link" href="/pricing">← Nouvelle analyse</a></p>
     """
     return shell("Rapport complet", inner)
 
 
-# ================= PRINT / PDF VIEW =================
+# ================= PRINT VIEW =================
 @app.get("/print/{doc_id}", response_class=HTMLResponse)
 def print_view(request: Request, doc_id: str):
     t = request.query_params.get("t")
